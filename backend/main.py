@@ -1,24 +1,34 @@
-from __future__ import annotations
-
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routes import router
+app = FastAPI(title="Clinic Scraper API")
 
-
-app = FastAPI(
-    title="Web Scraping API",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
+# CORS — update after first Vercel deploy with exact domain
+origins = [
+    "http://localhost:3000",
+    "https://localhost:3000",
+    "*",  # Replace with "https://your-app.vercel.app" in production
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(router)
+# Import and include your existing routes
+from .routes import router
+app.include_router(router, prefix="/api")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+# DigitalOcean App Platform provides PORT env var
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
