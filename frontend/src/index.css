@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { scroll-behavior: smooth; }
+  body { @apply bg-electric-dark text-white; }
+  html.light body { @apply bg-gray-50 text-gray-900; }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl;
+  }
+  html.light .glass-card {
+    @apply bg-white/90 border-gray-200 shadow-lg;
+  }
+  html.light .glass-card .text-white\/50,
+  html.light .glass-card .text-white\/60,
+  html.light .glass-card .text-white\/70,
+  html.light .glass-card .text-white\/40 {
+    @apply text-gray-500;
+  }
+  html.light .glass-card .metric-value {
+    @apply text-gray-900;
+  }
+  .metric-value {
+    @apply font-mono text-2xl font-bold tracking-tight;
+  }
+}
+
+@layer utilities {
+  .animate-fade-in-up {
+    animation: fadeInUp 0.5s ease-out forwards;
+    opacity: 0;
+  }
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .delay-100 { animation-delay: 100ms; }
+  .delay-200 { animation-delay: 200ms; }
+  .delay-300 { animation-delay: 300ms; }
+  .delay-400 { animation-delay: 400ms; }
+  .delay-500 { animation-delay: 500ms; }
+}
