@@ -4,11 +4,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Clinic Scraper API")
 
-# CORS — update after first Vercel deploy with exact domain
+# CORS — update with your actual Vercel URL after deploy
 origins = [
     "http://localhost:3000",
     "https://localhost:3000",
-    "*",  # Replace with "https://your-app.vercel.app" in production
+    "*",  # Replace with your Vercel URL after deploy
 ]
 
 app.add_middleware(
@@ -19,8 +19,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Import and include your existing routes
-from .routes import router
+# FIXED: Use absolute import instead of relative
+from routes import router
 app.include_router(router, prefix="/api")
 
 @app.get("/health")

@@ -6,9 +6,10 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .db import SQLiteStore
-from .models import ScrapeRequest, utc_now_iso
-from .scraper import scrape_url
+# FIXED: Absolute imports
+from db import SQLiteStore
+from models import ScrapeRequest, utc_now_iso
+from scraper import scrape_url
 
 
 router = APIRouter()
@@ -45,7 +46,6 @@ async def scrape(payload: ScrapeRequest, request: Request):
 
     try:
         result = await scrape_url(url)
-        # Preserve URL and timestamp fields on top-level response.
         store.save_history(url, domain, result)
         return JSONResponse(content=result)
     except HTTPException:

@@ -15,8 +15,8 @@ try:
 except Exception:  # pragma: no cover - optional in environments without Playwright runtime
     async_playwright = None  # type: ignore
 
-from .models import field_object, utc_now_iso
-from .predictor import (
+from models import field_object, utc_now_iso
+from predictor import (
     default_city_split,
     infer_clinic_type,
     predict_numeric,
