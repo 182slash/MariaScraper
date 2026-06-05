@@ -247,7 +247,10 @@ export default function Dashboard({ data, onScrapeNew }) {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="glass-card p-6">
               <div className="text-white/50 text-sm mb-2">Membership Package Penetration</div>
-              <div className="metric-value text-4xl text-electric-blue">{data.membership_marketing.membership_penetration.value}{data.membership_marketing.membership_penetration.unit}</div>
+              <div className="metric-value text-4xl text-electric-blue">
+  {data.membership_marketing.membership_penetration.value ?? '—'}
+  {data.membership_marketing.membership_penetration.value != null && data.membership_marketing.membership_penetration.unit}
+</div>
               <div className="mt-2"><ConfidenceBadge source={data.membership_marketing.membership_penetration.source} confidence={data.membership_marketing.membership_penetration.confidence} /></div>
             </div>
             <div className="glass-card p-6">
