@@ -28,7 +28,7 @@ export default function URLInput({ onSuccess, recent }) {
             <Globe className="w-8 h-8 text-electric-blue" />
           </div>
           <h1 className="text-4xl md:text-5xl font-bold font-sans mb-3 tracking-tight">
-            Clinic Analytics <span className="text-electric-blue">Scraper</span>
+            Maria <span className="text-electric-blue">Scraper</span>
           </h1>
           <p className="text-white/60 text-lg">
             Enter any clinic website URL to extract financial & operational insights

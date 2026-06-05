@@ -20,17 +20,17 @@ def _domain(url: str) -> str:
     return urlparse(url).netloc.lower()
 
 
-@router.get("/api/health")
+@router.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@router.get("/api/history")
+@router.get("/history")
 async def history():
     return {"success": True, "items": store.get_history(limit=50)}
 
 
-@router.post("/api/scrape")
+@router.post("/scrape")
 async def scrape(payload: ScrapeRequest, request: Request):
     url = payload.url.strip()
     domain = _domain(url)
