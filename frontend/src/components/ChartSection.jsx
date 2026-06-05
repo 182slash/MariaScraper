@@ -55,11 +55,13 @@ export default function ChartSection({ data }) {
               />
               <Tooltip
                 contentStyle={{
-                  backgroundColor: '#1e293b',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: '12px',
-                  color: '#fff',
-                }}
+  backgroundColor: '#0D1729',
+  border: '1px solid rgba(0,255,229,0.25)',
+  borderRadius: '10px',
+  color: '#ffffff',
+  boxShadow: '0 0 20px rgba(0,255,229,0.15)',
+  fontSize: '13px',
+}}
                 formatter={v => [`${v} ${activeUnit}`, metrics[metric].label]}
               />
               <Line

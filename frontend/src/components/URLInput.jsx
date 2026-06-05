@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { useScraper } from '../hooks/useScraper'
 import { Globe, ArrowRight, AlertCircle, RotateCcw, Clock } from 'lucide-react'
 
+const STEPS = ['Connect', 'Extract', 'Patients', 'Model', 'Render']
+
 export default function URLInput({ onSuccess, recent }) {
   const [url, setUrl] = useState('')
   const { scrape, loading, error, progress, statusMessage } = useScraper()
@@ -9,100 +11,80 @@ export default function URLInput({ onSuccess, recent }) {
   const handleSubmit = async (e) => {
     e.preventDefault()
     if (!url.trim()) return
-    try {
-      const data = await scrape(url)
-      onSuccess(data)
-    } catch { /* handled in hook */ }
+    try { const data = await scrape(url); onSuccess(data) } catch {}
   }
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 relative overflow-hidden">
 
-      {/* Ambient orbs */}
+      {/* Background depth */}
       <div className="absolute inset-0 pointer-events-none">
-        <div className="absolute top-[-20%] left-[-10%] w-[600px] h-[600px] rounded-full"
-          style={{ background: 'radial-gradient(circle, rgba(0,255,229,0.06) 0%, transparent 70%)' }} />
-        <div className="absolute bottom-[-20%] right-[-10%] w-[500px] h-[500px] rounded-full"
-          style={{ background: 'radial-gradient(circle, rgba(191,95,255,0.06) 0%, transparent 70%)' }} />
-        {/* Grid */}
-        <div className="absolute inset-0 opacity-40"
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[900px] h-[500px]"
+          style={{ background: 'radial-gradient(ellipse at center top, rgba(0,210,255,0.06) 0%, transparent 65%)' }} />
+        <div className="absolute bottom-0 right-0 w-[600px] h-[400px]"
+          style={{ background: 'radial-gradient(ellipse at right bottom, rgba(120,80,255,0.05) 0%, transparent 65%)' }} />
+        <div className="absolute inset-0"
           style={{
-            backgroundImage: `linear-gradient(rgba(0,255,229,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(0,255,229,0.04) 1px, transparent 1px)`,
-            backgroundSize: '48px 48px',
+            backgroundImage: `linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+                              linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px)`,
+            backgroundSize: '60px 60px',
           }} />
       </div>
 
-      <div className="w-full max-w-xl relative z-10 animate-fade-in-up">
+      <div className="w-full max-w-lg relative z-10">
 
-        {/* Logo / Header */}
-        <div className="text-center mb-12">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl mb-6"
+        {/* Header */}
+        <div className="text-center mb-14 animate-fade-in-up">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl mb-7"
             style={{
-              background: 'rgba(0,255,229,0.08)',
-              border: '1px solid rgba(0,255,229,0.2)',
-              boxShadow: '0 0 30px rgba(0,255,229,0.12)',
+              background: 'rgba(0,210,255,0.07)',
+              border: '1px solid rgba(0,210,255,0.18)',
+              boxShadow: '0 0 40px rgba(0,210,255,0.1)',
             }}>
-            <Globe className="w-8 h-8" style={{ color: '#00FFE5' }} />
+            <Globe className="w-6 h-6" style={{ color: '#00D2FF' }} />
           </div>
-
-          <h1 className="text-5xl font-bold font-display mb-3 tracking-tight">
+          <div className="section-label mb-3">Clinic Intelligence Platform</div>
+          <h1 className="text-4xl font-bold tracking-tight mb-3" style={{ letterSpacing: '-0.03em' }}>
             Maria{' '}
-            <span style={{
-              color: '#00FFE5',
-              textShadow: '0 0 30px rgba(0,255,229,0.5)',
-            }}>
-              Scraper
-            </span>
+            <span style={{ color: '#00D2FF' }}>Scraper</span>
           </h1>
-          <p className="text-white/40 text-base leading-relaxed">
-            Enter any clinic URL to extract financial &amp; operational intelligence
+          <p style={{ color: 'rgba(255,255,255,0.38)', fontSize: '15px', lineHeight: '1.6' }}>
+            Extract financial & operational intelligence<br />from any clinic website
           </p>
         </div>
 
         {/* Recent */}
         {recent.length > 0 && (
           <div className="mb-5 animate-fade-in-up delay-100">
-            <div className="flex items-center gap-2 text-xs text-white/30 mb-3 uppercase tracking-widest">
-              <Clock className="w-3.5 h-3.5" />
-              <span>Recent</span>
+            <div className="flex items-center gap-2 mb-3">
+              <Clock className="w-3.5 h-3.5" style={{ color: 'rgba(255,255,255,0.25)' }} />
+              <span className="section-label">Recent</span>
             </div>
             <div className="flex flex-wrap gap-2">
               {recent.map((item, i) => (
                 <button key={i} onClick={() => setUrl(item.url)}
-                  className="px-3 py-1.5 rounded-full text-xs text-white/50 transition-all hover:text-white/80"
-                  style={{
-                    background: 'rgba(255,255,255,0.04)',
-                    border: '1px solid rgba(255,255,255,0.08)',
-                  }}
-                  onMouseEnter={e => e.currentTarget.style.borderColor = 'rgba(0,255,229,0.3)'}
-                  onMouseLeave={e => e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'}
-                >
-                  {item.url.replace(/^https?:\/\//, '').slice(0, 32)}{item.url.length > 32 ? '…' : ''}
+                  className="btn-ghost text-xs py-1.5 px-3 rounded-full">
+                  {item.url.replace(/^https?:\/\//, '').slice(0, 35)}{item.url.length > 35 ? '…' : ''}
                 </button>
               ))}
             </div>
           </div>
         )}
 
-        {/* Input form */}
+        {/* Input */}
         <form onSubmit={handleSubmit} className="animate-fade-in-up delay-200">
-          <div className="flex items-center gap-2 p-2 rounded-2xl"
-            style={{
-              background: 'rgba(13,23,41,0.8)',
-              border: '1px solid rgba(0,255,229,0.2)',
-              boxShadow: '0 0 0 1px rgba(0,255,229,0.05), 0 8px 32px rgba(0,0,0,0.4)',
-              backdropFilter: 'blur(20px)',
-            }}>
+          <div className="glass-card p-2 flex items-center gap-2"
+            style={{ borderColor: 'rgba(0,210,255,0.2)', boxShadow: '0 0 0 1px rgba(0,210,255,0.04), 0 8px 40px rgba(0,0,0,0.5)' }}>
             <input
               type="url"
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={e => setUrl(e.target.value)}
               placeholder="https://clinic-website.com"
-              className="flex-1 bg-transparent px-4 py-3 text-base outline-none"
-              style={{ color: 'rgba(255,255,255,0.9)', caretColor: '#00FFE5' }}
+              className="flex-1 bg-transparent px-4 py-3 outline-none text-sm"
+              style={{ color: 'rgba(255,255,255,0.9)', caretColor: '#00D2FF' }}
               required
             />
-            <button type="submit" disabled={loading} className="btn-solid px-5 py-3 shrink-0 flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl">
+            <button type="submit" disabled={loading} className="btn-solid rounded-xl shrink-0">
               {loading ? 'Analyzing…' : 'Analyze'}
               <ArrowRight className="w-4 h-4" />
             </button>
@@ -111,28 +93,28 @@ export default function URLInput({ onSuccess, recent }) {
 
         {/* Progress */}
         {loading && (
-          <div className="mt-6 p-5 rounded-2xl animate-fade-in-up"
-            style={{
-              background: 'rgba(13,23,41,0.8)',
-              border: '1px solid rgba(0,255,229,0.15)',
-              backdropFilter: 'blur(20px)',
-            }}>
-            <div className="flex justify-between text-sm mb-2">
-              <span style={{ color: '#00FFE5', fontWeight: 500 }}>{statusMessage}</span>
-              <span className="font-mono text-white/40">{Math.round(progress)}%</span>
+          <div className="mt-5 glass-card p-5 animate-fade-in-up"
+            style={{ borderColor: 'rgba(0,210,255,0.15)' }}>
+            <div className="flex justify-between mb-3">
+              <span style={{ color: '#00D2FF', fontSize: '13px', fontWeight: 500 }}>{statusMessage}</span>
+              <span className="font-mono text-xs" style={{ color: 'rgba(255,255,255,0.35)' }}>{Math.round(progress)}%</span>
             </div>
-            <div className="h-1.5 bg-white/8 rounded-full overflow-hidden">
-              <div className="h-full rounded-full transition-all duration-500"
+            <div className="h-px mb-4" style={{ background: 'rgba(255,255,255,0.06)' }}>
+              <div className="h-full transition-all duration-500"
                 style={{
                   width: `${progress}%`,
-                  background: 'linear-gradient(90deg, #00FFE5, #BF5FFF)',
-                  boxShadow: '0 0 10px rgba(0,255,229,0.5)',
+                  background: 'linear-gradient(90deg, #00D2FF, #7850FF)',
+                  boxShadow: '0 0 8px rgba(0,210,255,0.6)',
+                  height: '1px',
                 }} />
             </div>
-            <div className="flex gap-1.5 mt-3">
-              {['Connect', 'Finance', 'Patients', 'AI', 'Build'].map((step, i) => (
-                <div key={step} className="flex-1 h-0.5 rounded-full transition-all duration-300"
-                  style={{ background: progress >= ((i + 1) / 5) * 100 ? '#00FFE5' : 'rgba(255,255,255,0.08)' }} />
+            <div className="flex gap-2">
+              {STEPS.map((step, i) => (
+                <div key={step} className="flex-1 flex flex-col gap-1.5">
+                  <div className="h-px rounded-full transition-all duration-400"
+                    style={{ background: progress >= ((i + 1) / STEPS.length) * 100 ? '#00D2FF' : 'rgba(255,255,255,0.07)' }} />
+                  <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.25)', letterSpacing: '0.06em' }}>{step}</span>
+                </div>
               ))}
             </div>
           </div>
@@ -140,23 +122,14 @@ export default function URLInput({ onSuccess, recent }) {
 
         {/* Error */}
         {error && (
-          <div className="mt-5 p-5 rounded-2xl animate-fade-in-up"
-            style={{
-              background: 'rgba(255,45,120,0.06)',
-              border: '1px solid rgba(255,45,120,0.25)',
-              backdropFilter: 'blur(20px)',
-            }}>
-            <div className="flex items-start gap-3">
-              <AlertCircle className="w-5 h-5 mt-0.5 shrink-0" style={{ color: '#FF2D78' }} />
-              <div className="flex-1">
-                <p className="font-semibold text-sm mb-1" style={{ color: '#FF2D78' }}>Analysis Failed</p>
-                <p className="text-white/50 text-sm mb-3">{error}</p>
-                <button
-                  onClick={() => scrape(url).then(onSuccess).catch(() => {})}
-                  className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium text-white/60 hover:text-white transition-all"
-                  style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)' }}
-                >
-                  <RotateCcw className="w-3.5 h-3.5" /> Try Again
+          <div className="mt-4 glass-card card-red p-5 animate-fade-in-up">
+            <div className="flex gap-3">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" style={{ color: '#FF3C64' }} />
+              <div>
+                <p className="text-sm font-semibold mb-1" style={{ color: '#FF3C64' }}>Analysis Failed</p>
+                <p className="text-sm mb-3" style={{ color: 'rgba(255,255,255,0.45)' }}>{error}</p>
+                <button onClick={() => scrape(url).then(onSuccess).catch(() => {})} className="btn-ghost text-xs">
+                  <RotateCcw className="w-3 h-3" /> Try Again
                 </button>
               </div>
             </div>

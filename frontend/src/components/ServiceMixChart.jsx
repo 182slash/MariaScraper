@@ -1,23 +1,61 @@
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
 
-export default function ServiceMixChart({ skinData, dentalData, clinicType }) {
-  const showSkin = clinicType === 'skin' || clinicType === 'both'
-  const showDental = clinicType === 'dental' || clinicType === 'both'
+const tooltipStyle = {
+  backgroundColor: '#0D1729',
+  border: '1px solid rgba(0,255,229,0.25)',
+  borderRadius: '10px',
+  color: '#ffffff',
+  boxShadow: '0 0 20px rgba(0,255,229,0.15)',
+  fontSize: '13px',
+}
 
-  const renderChart = (data, title) => (
-    <div className="glass-card p-6 animate-fade-in-up">
-      <h3 className="text-lg font-semibold mb-4">{title}</h3>
-      <div className="h-64">
+export default function ServiceMixChart({ skinData, dentalData, clinicType }) {
+  const showSkin   = clinicType === 'skin'   || clinicType === 'both' || clinicType === 'unknown'
+  const showDental = clinicType === 'dental' || clinicType === 'both' || clinicType === 'unknown'
+
+  const renderChart = (data, title, accentColor) => (
+    <div className="glass-card p-6">
+      <h3 className="text-sm font-semibold mb-5 uppercase tracking-widest"
+        style={{ color: accentColor }}>{title}</h3>
+      <div className="h-72">
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={data} layout="vertical" margin={{ left: 20 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-            <XAxis type="number" stroke="rgba(255,255,255,0.3)" tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 12 }} unit="%" />
-            <YAxis type="category" dataKey="name" stroke="rgba(255,255,255,0.3)" tick={{ fill: 'rgba(255,255,255,0.7)', fontSize: 11 }} width={140} />
-            <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px', color: '#fff' }} formatter={(v) => [`${v}%`, 'Revenue Share']} />
-            <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={20}>
-              {data.map((entry, i) => (
-                <Cell key={i} fill={entry.source === 'scraped' ? '#00D4FF' : '#fbbf24'} fillOpacity={0.85} />
-              ))}
+          <BarChart data={data} layout="vertical" margin={{ left: 8, right: 16 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" horizontal={false} />
+            <XAxis
+              type="number"
+              stroke="rgba(255,255,255,0.1)"
+              tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 11 }}
+              unit="%"
+              axisLine={false}
+              tickLine={false}
+            />
+            <YAxis
+              type="category"
+              dataKey="name"
+              stroke="rgba(255,255,255,0.1)"
+              tick={{ fill: 'rgba(255,255,255,0.6)', fontSize: 11 }}
+              width={148}
+              axisLine={false}
+              tickLine={false}
+            />
+            <Tooltip
+              contentStyle={tooltipStyle}
+              itemStyle={{ color: '#ffffff' }}
+              cursor={{ fill: 'rgba(255,255,255,0.04)' }}
+              formatter={(v) => [`${v}%`, 'Revenue Share']}
+            />
+            <Bar dataKey="value" radius={[0, 6, 6, 0]} barSize={16}>
+              {data.map((entry, i) => {
+                const color = entry.source === 'scraped' ? '#00FF94' : accentColor
+                return (
+                  <Cell
+                    key={i}
+                    fill={color}
+                    fillOpacity={0.85}
+                    style={{ filter: `drop-shadow(0 0 4px ${color}60)` }}
+                  />
+                )
+              })}
             </Bar>
           </BarChart>
         </ResponsiveContainer>
@@ -27,8 +65,8 @@ export default function ServiceMixChart({ skinData, dentalData, clinicType }) {
 
   return (
     <div className={`grid ${showSkin && showDental ? 'grid-cols-1 lg:grid-cols-2' : 'grid-cols-1'} gap-4`}>
-      {showSkin && renderChart(skinData, 'Skin Clinic Services')}
-      {showDental && renderChart(dentalData, 'Dental Clinic Services')}
+      {showSkin   && renderChart(skinData,   'Skin Clinic Services',   '#00FFE5')}
+      {showDental && renderChart(dentalData, 'Dental Clinic Services', '#BF5FFF')}
     </div>
   )
 }
