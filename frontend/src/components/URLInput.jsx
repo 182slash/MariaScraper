@@ -60,7 +60,7 @@ export default function URLInput({ onSuccess, recent }) {
           </div>
           <div className="section-label mb-3">Clinic Intelligence Platform</div>
           <h1 className="text-4xl font-bold tracking-tight mb-3" style={{ letterSpacing: '-0.03em' }}>
-            Maria{' '}
+            MD{' '}
             <span style={{ color: '#00D2FF' }}>Scraper</span>
           </h1>
           <p style={{ color: 'rgba(255,255,255,0.38)', fontSize: '15px', lineHeight: '1.6' }}>
