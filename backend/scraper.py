@@ -93,9 +93,18 @@ async def fetch_html_playwright(url: str, timeout_s: int = 30) -> Tuple[str, str
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
+    headless=True,
+    args=[
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-setuid-sandbox",
+        "--single-process",
+        "--no-zygote",
+        "--disable-accelerated-2d-canvas",
+        "--disable-web-security",
+    ],
+)
             ctx = await browser.new_context(
                 user_agent=USER_AGENT,
                 locale="en-US",
