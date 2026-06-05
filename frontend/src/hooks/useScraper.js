@@ -2,20 +2,15 @@ import { useState, useCallback, useRef } from 'react'
 
 const API_URL = import.meta.env.VITE_API_URL
 
-// ── Phase definitions ─────────────────────────────────────────────────────────
-// Each phase has a label, the progress % it STARTS at, and its expected
-// duration (ms) based on the backend's MIN_SCRAPE_SECONDS = 14s floor.
-// Progress advances smoothly within each phase using a decay curve so it
-// never hits 100% until we actually get a response.
 const PHASES = [
-  { label: 'Connecting to website…',          start:  0, duration: 3_000 },
-  { label: 'Fetching page & sub-pages…',       start: 12, duration: 5_000 },
-  { label: 'Extracting structured data…',      start: 30, duration: 3_000 },
-  { label: 'Running prediction engine…',       start: 52, duration: 3_500 },
-  { label: 'Calculating confidence scores…',   start: 72, duration: 2_500 },
-  { label: 'Finalising dashboard…',            start: 88, duration: 2_000 },
+  { label: 'Connecting to website…',        start:  0, duration: 3_000 },
+  { label: 'Fetching page & sub-pages…',    start: 12, duration: 5_000 },
+  { label: 'Extracting structured data…',   start: 30, duration: 3_000 },
+  { label: 'Running prediction engine…',    start: 52, duration: 3_500 },
+  { label: 'Calculating confidence scores…',start: 72, duration: 2_500 },
+  { label: 'Finalising dashboard…',         start: 88, duration: 2_000 },
 ]
-const PROGRESS_CAP = 93   // never exceed this until the response arrives
+const PROGRESS_CAP = 93
 
 // ── Response transformer ──────────────────────────────────────────────────────
 
@@ -39,24 +34,24 @@ const transformApiResponse = (raw) => {
   const dentalRaw = d.service_mix_dental || {}
 
   const skinData = [
-    { name: 'Skin Health',              value: skinRaw.skin_health_pct?.value          || 0, source: skinRaw.skin_health_pct?.source          || 'predicted', confidence: skinRaw.skin_health_pct?.confidence          || 0.33 },
-    { name: 'Injectables & Anti-Aging', value: skinRaw.injectables_antiaging_pct?.value || 0, source: skinRaw.injectables_antiaging_pct?.source || 'predicted', confidence: skinRaw.injectables_antiaging_pct?.confidence || 0.33 },
-    { name: 'Body Aesthetics',          value: skinRaw.body_aesthetics_pct?.value       || 0, source: skinRaw.body_aesthetics_pct?.source       || 'predicted', confidence: skinRaw.body_aesthetics_pct?.confidence       || 0.33 },
-    { name: 'Hair Solutions',           value: skinRaw.hair_solutions_pct?.value        || 0, source: skinRaw.hair_solutions_pct?.source        || 'predicted', confidence: skinRaw.hair_solutions_pct?.confidence        || 0.33 },
-    { name: 'Non-Doctor Treatments',    value: skinRaw.non_doctor_treatments_pct?.value || 0, source: skinRaw.non_doctor_treatments_pct?.source || 'predicted', confidence: skinRaw.non_doctor_treatments_pct?.confidence || 0.33 },
-    { name: 'Others',                   value: skinRaw.other_services_skin_pct?.value   || 0, source: skinRaw.other_services_skin_pct?.source   || 'predicted', confidence: skinRaw.other_services_skin_pct?.confidence   || 0.33 },
+    { name: 'Skin Health',              value: skinRaw.skin_health_pct?.value           ?? 0, source: skinRaw.skin_health_pct?.source           ?? 'predicted', confidence: skinRaw.skin_health_pct?.confidence           ?? 0.33 },
+    { name: 'Injectables & Anti-Aging', value: skinRaw.injectables_antiaging_pct?.value ?? 0, source: skinRaw.injectables_antiaging_pct?.source  ?? 'predicted', confidence: skinRaw.injectables_antiaging_pct?.confidence  ?? 0.33 },
+    { name: 'Body Aesthetics',          value: skinRaw.body_aesthetics_pct?.value        ?? 0, source: skinRaw.body_aesthetics_pct?.source        ?? 'predicted', confidence: skinRaw.body_aesthetics_pct?.confidence        ?? 0.33 },
+    { name: 'Hair Solutions',           value: skinRaw.hair_solutions_pct?.value         ?? 0, source: skinRaw.hair_solutions_pct?.source         ?? 'predicted', confidence: skinRaw.hair_solutions_pct?.confidence         ?? 0.33 },
+    { name: 'Non-Doctor Treatments',    value: skinRaw.non_doctor_treatments_pct?.value  ?? 0, source: skinRaw.non_doctor_treatments_pct?.source  ?? 'predicted', confidence: skinRaw.non_doctor_treatments_pct?.confidence  ?? 0.33 },
+    { name: 'Others',                   value: skinRaw.other_services_skin_pct?.value    ?? 0, source: skinRaw.other_services_skin_pct?.source    ?? 'predicted', confidence: skinRaw.other_services_skin_pct?.confidence    ?? 0.33 },
   ]
 
   const dentalData = [
-    { name: 'Scaling',        value: dentalRaw.scaling_pct?.value               || 0, source: dentalRaw.scaling_pct?.source               || 'predicted', confidence: dentalRaw.scaling_pct?.confidence               || 0.33 },
-    { name: 'Fillings',       value: dentalRaw.fillings_pct?.value              || 0, source: dentalRaw.fillings_pct?.source              || 'predicted', confidence: dentalRaw.fillings_pct?.confidence              || 0.33 },
-    { name: 'Braces',         value: dentalRaw.braces_pct?.value                || 0, source: dentalRaw.braces_pct?.source                || 'predicted', confidence: dentalRaw.braces_pct?.confidence                || 0.33 },
-    { name: 'Veneers',        value: dentalRaw.veneers_pct?.value               || 0, source: dentalRaw.veneers_pct?.source               || 'predicted', confidence: dentalRaw.veneers_pct?.confidence               || 0.33 },
-    { name: 'Endodontics',    value: dentalRaw.endodontics_pct?.value           || 0, source: dentalRaw.endodontics_pct?.source           || 'predicted', confidence: dentalRaw.endodontics_pct?.confidence           || 0.33 },
-    { name: 'Periodontics',   value: dentalRaw.periodontics_pct?.value          || 0, source: dentalRaw.periodontics_pct?.source          || 'predicted', confidence: dentalRaw.periodontics_pct?.confidence          || 0.33 },
-    { name: 'Prosthodontics', value: dentalRaw.prosthodontics_pct?.value        || 0, source: dentalRaw.prosthodontics_pct?.source        || 'predicted', confidence: dentalRaw.prosthodontics_pct?.confidence        || 0.33 },
-    { name: 'Pedodontics',    value: dentalRaw.pedodontics_pct?.value           || 0, source: dentalRaw.pedodontics_pct?.source           || 'predicted', confidence: dentalRaw.pedodontics_pct?.confidence           || 0.33 },
-    { name: 'Others',         value: dentalRaw.other_services_dental_pct?.value || 0, source: dentalRaw.other_services_dental_pct?.source || 'predicted', confidence: dentalRaw.other_services_dental_pct?.confidence || 0.33 },
+    { name: 'Scaling',        value: dentalRaw.scaling_pct?.value                ?? 0, source: dentalRaw.scaling_pct?.source                ?? 'predicted', confidence: dentalRaw.scaling_pct?.confidence                ?? 0.33 },
+    { name: 'Fillings',       value: dentalRaw.fillings_pct?.value               ?? 0, source: dentalRaw.fillings_pct?.source               ?? 'predicted', confidence: dentalRaw.fillings_pct?.confidence               ?? 0.33 },
+    { name: 'Braces',         value: dentalRaw.braces_pct?.value                 ?? 0, source: dentalRaw.braces_pct?.source                 ?? 'predicted', confidence: dentalRaw.braces_pct?.confidence                 ?? 0.33 },
+    { name: 'Veneers',        value: dentalRaw.veneers_pct?.value                ?? 0, source: dentalRaw.veneers_pct?.source                ?? 'predicted', confidence: dentalRaw.veneers_pct?.confidence                ?? 0.33 },
+    { name: 'Endodontics',    value: dentalRaw.endodontics_pct?.value            ?? 0, source: dentalRaw.endodontics_pct?.source            ?? 'predicted', confidence: dentalRaw.endodontics_pct?.confidence            ?? 0.33 },
+    { name: 'Periodontics',   value: dentalRaw.periodontics_pct?.value           ?? 0, source: dentalRaw.periodontics_pct?.source           ?? 'predicted', confidence: dentalRaw.periodontics_pct?.confidence           ?? 0.33 },
+    { name: 'Prosthodontics', value: dentalRaw.prosthodontics_pct?.value         ?? 0, source: dentalRaw.prosthodontics_pct?.source         ?? 'predicted', confidence: dentalRaw.prosthodontics_pct?.confidence         ?? 0.33 },
+    { name: 'Pedodontics',    value: dentalRaw.pedodontics_pct?.value            ?? 0, source: dentalRaw.pedodontics_pct?.source            ?? 'predicted', confidence: dentalRaw.pedodontics_pct?.confidence            ?? 0.33 },
+    { name: 'Others',         value: dentalRaw.other_services_dental_pct?.value  ?? 0, source: dentalRaw.other_services_dental_pct?.source  ?? 'predicted', confidence: dentalRaw.other_services_dental_pct?.confidence  ?? 0.33 },
   ]
 
   const predictions = (raw.predictions_log || []).map(p => ({
@@ -71,6 +66,7 @@ const transformApiResponse = (raw) => {
   return {
     url:                raw.url,
     clinic_type:        raw.clinic_type || meta?.clinic_type || 'unknown',
+    // FIX: always use the fresh scraped_at from this response, never stale
     timestamp:          raw.scraped_at,
     overall_confidence: meta?.overall_confidence ?? 0.43,
     favicon:            `https://www.google.com/s2/favicons?domain=${encodeURIComponent(raw.url)}&sz=64`,
@@ -148,11 +144,11 @@ const transformApiResponse = (raw) => {
     predictions_log: predictions,
 
     scrape_summary: {
-      total_scraped:    ss.scraped_fields    ?? 0,
-      total_predicted:  ss.predicted_fields  ?? 0,
-      pages_crawled:    ss.pages_crawled     ?? 1,
-      elapsed_seconds:  ss.elapsed_seconds   ?? null,
-      subpages_found:   ss.subpages_found    ?? [],
+      total_scraped:   ss.scraped_fields   ?? 0,
+      total_predicted: ss.predicted_fields ?? 0,
+      pages_crawled:   ss.pages_crawled    ?? 1,
+      elapsed_seconds: ss.elapsed_seconds  ?? null,
+      subpages_found:  ss.subpages_found   ?? [],
     },
   }
 }
@@ -166,14 +162,14 @@ const getMockData = (url) => ({
   overall_confidence: 0.82,
   favicon: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(url)}&sz=64`,
   financial: {
-    revenue_latest:        { value: 45.2, unit: 'B IDR', source: 'scraped',   confidence: 0.9  },
-    ebitda_margin:         { value: 28.5, unit: '%',     source: 'predicted', confidence: 0.65 },
-    gross_margin:          { value: 72.3, unit: '%',     source: 'scraped',   confidence: 0.88 },
-    avg_transaction_value: { value: 1.2,  unit: 'M IDR', source: 'predicted', confidence: 0.6  },
-    cac:                   { value: 850,  unit: 'K IDR', source: 'predicted', confidence: 0.55 },
-    ltv:                   { value: 12.5, unit: 'M IDR', source: 'predicted', confidence: 0.58 },
-    marketing_spend_pct:   { value: 8.4,  unit: '%',     source: 'scraped',   confidence: 0.85 },
-    investment_per_clinic: { value: 3.2,  unit: 'B IDR', source: 'scraped',   confidence: 0.92 },
+    revenue_latest:        { value: 45.2,  unit: 'B IDR', source: 'scraped',   confidence: 0.9  },
+    ebitda_margin:         { value: 28.5,  unit: '%',     source: 'predicted', confidence: 0.65 },
+    gross_margin:          { value: 72.3,  unit: '%',     source: 'scraped',   confidence: 0.88 },
+    avg_transaction_value: { value: 1.2,   unit: 'M IDR', source: 'predicted', confidence: 0.6  },
+    cac:                   { value: 850,   unit: 'K IDR', source: 'predicted', confidence: 0.55 },
+    ltv:                   { value: 12.5,  unit: 'M IDR', source: 'predicted', confidence: 0.58 },
+    marketing_spend_pct:   { value: 8.4,   unit: '%',     source: 'scraped',   confidence: 0.85 },
+    investment_per_clinic: { value: 3.2,   unit: 'B IDR', source: 'scraped',   confidence: 0.92 },
   },
   revenue_trends: {
     years:               [2020, 2021, 2022, 2023, 2024, 2025],
@@ -266,46 +262,38 @@ export function useScraper() {
   const [statusMessage, setStatusMessage] = useState('')
   const [elapsedSecs,   setElapsedSecs]   = useState(null)
 
-  // We use a ref for the interval so we can cancel it from anywhere.
-  const timerRef    = useRef(null)
-  const startTsRef  = useRef(null)
-  const elapsedRef  = useRef(null)   // running elapsed-seconds ticker
+  // FIX: track the URL currently being scraped so the caller can detect
+  // mid-flight domain changes and discard stale results.
+  const [activeUrl, setActiveUrl] = useState(null)
+
+  const timerRef   = useRef(null)
+  const startTsRef = useRef(null)
+  const elapsedRef = useRef(null)
+  // FIX: abort controller — cancels any in-flight fetch if scrape() is called again
+  const abortRef   = useRef(null)
 
   const _stopTimers = () => {
     if (timerRef.current)   { clearInterval(timerRef.current);   timerRef.current   = null }
     if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null }
   }
 
-  /**
-   * Advance progress using a smooth decay curve within each phase.
-   *
-   * The progress bar moves quickly at the start of each phase then
-   * decelerates, so it never quite reaches the next phase's start before
-   * the real event fires.  This gives an honest "still working" feel
-   * without false precision.
-   */
   const _runProgressTimeline = () => {
-    let phaseIdx  = 0
+    let phaseIdx   = 0
     let phaseStart = performance.now()
 
     timerRef.current = setInterval(() => {
       const phase = PHASES[phaseIdx]
       const next  = PHASES[phaseIdx + 1]
-
-      // How far through the current phase are we? (0–1)
-      const elapsed   = performance.now() - phaseStart
-      const t         = Math.min(elapsed / phase.duration, 1)
-
-      // Ease-out: fast start, slow finish.  Progress = start + range * ease(t)
-      const rangeEnd  = next ? next.start : PROGRESS_CAP
-      const range     = rangeEnd - phase.start
-      const eased     = 1 - Math.pow(1 - t, 2.5)   // ease-out power curve
-      const current   = Math.min(phase.start + range * eased, PROGRESS_CAP)
+      const elapsed = performance.now() - phaseStart
+      const t       = Math.min(elapsed / phase.duration, 1)
+      const rangeEnd = next ? next.start : PROGRESS_CAP
+      const range    = rangeEnd - phase.start
+      const eased    = 1 - Math.pow(1 - t, 2.5)
+      const current  = Math.min(phase.start + range * eased, PROGRESS_CAP)
 
       setProgress(Math.round(current))
       setStatusMessage(phase.label)
 
-      // Advance to the next phase when this one's duration is exceeded.
       if (t >= 1 && next) {
         phaseIdx  += 1
         phaseStart = performance.now()
@@ -314,14 +302,27 @@ export function useScraper() {
   }
 
   const scrape = useCallback(async (url) => {
+    // ── FIX: Cancel any previous in-flight request immediately ───────────────
+    // This prevents a slow first scrape from overwriting a faster second one.
+    if (abortRef.current) {
+      abortRef.current.abort()
+    }
+    abortRef.current = new AbortController()
+    const signal = abortRef.current.signal
+
+    // ── FIX: Full state reset before every scrape ─────────────────────────────
+    // This guarantees the dashboard NEVER shows data from a previous run
+    // while the new one is loading — not even for a single frame.
+    _stopTimers()
     setLoading(true)
     setError(null)
     setProgress(0)
     setElapsedSecs(null)
     setStatusMessage(PHASES[0].label)
+    setActiveUrl(url)   // signals to parent: "this URL is now being scraped"
+
     startTsRef.current = Date.now()
 
-    // Elapsed-seconds ticker (updates every second).
     elapsedRef.current = setInterval(() => {
       setElapsedSecs(Math.floor((Date.now() - startTsRef.current) / 1_000))
     }, 1_000)
@@ -331,24 +332,25 @@ export function useScraper() {
 
       if (isDemo) {
         _runProgressTimeline()
-        // Simulate the backend's MIN_SCRAPE_SECONDS floor.
-        await new Promise(r => setTimeout(r, 15_000))
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(resolve, 15_000)
+          signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')) })
+        })
         _stopTimers()
         setProgress(100)
         setLoading(false)
+        setActiveUrl(null)
         setElapsedSecs(Math.floor((Date.now() - startTsRef.current) / 1_000))
         return getMockData(url)
       }
 
-      // Real API call — progress timeline runs concurrently with the fetch.
       _runProgressTimeline()
 
       const res = await fetch(`${API_URL}/api/scrape`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ url }),
-        // No artificial timeout: the backend enforces MIN_SCRAPE_SECONDS
-        // and the browser default (no timeout) is correct here.
+        signal,   // FIX: pass abort signal so the fetch is truly cancelled
       })
 
       _stopTimers()
@@ -359,24 +361,39 @@ export function useScraper() {
       }
 
       const raw  = await res.json()
-      const data = transformApiResponse(raw)
 
+      // FIX: verify the response domain matches what we asked for.
+      // If the user submitted a new URL while this was in flight and the
+      // abort somehow didn't fire, discard the stale result silently.
+      const requestedDomain = new URL(url).hostname
+      const responseDomain  = new URL(raw.url || url).hostname
+      if (requestedDomain !== responseDomain) {
+        throw new Error(`Domain mismatch: got ${responseDomain}, expected ${requestedDomain}`)
+      }
+
+      const data = transformApiResponse(raw)
       const serverElapsed = raw.scrape_summary?.elapsed_seconds ?? null
+
       setElapsedSecs(serverElapsed ?? Math.floor((Date.now() - startTsRef.current) / 1_000))
       setProgress(100)
       setLoading(false)
+      setActiveUrl(null)
       return data
 
     } catch (err) {
+      // AbortError means a new scrape was started — don't surface this as an error.
+      if (err.name === 'AbortError') return
+
       _stopTimers()
       const msg = err.message || 'Failed to scrape website. Please try again.'
       setError(msg)
       setLoading(false)
       setProgress(0)
       setElapsedSecs(null)
+      setActiveUrl(null)
       throw err
     }
   }, [])
 
-  return { scrape, loading, error, progress, statusMessage, elapsedSecs }
+  return { scrape, loading, error, progress, statusMessage, elapsedSecs, activeUrl }
 }

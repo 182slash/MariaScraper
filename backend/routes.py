@@ -6,7 +6,6 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-# FIXED: Absolute imports
 from db import SQLiteStore
 from models import ScrapeRequest, utc_now_iso
 from scraper import scrape_url
@@ -30,6 +29,16 @@ async def history():
     return {"success": True, "items": store.get_history(limit=50)}
 
 
+@router.delete("/history/{domain}")
+async def delete_domain_history(domain: str):
+    """
+    Manually clear stored data for a domain so the next scrape
+    starts completely fresh (useful during development/testing).
+    """
+    deleted = store.delete_domain(domain)
+    return {"success": True, "deleted": deleted, "domain": domain}
+
+
 @router.post("/scrape")
 async def scrape(payload: ScrapeRequest, request: Request):
     url = payload.url.strip()
@@ -38,14 +47,24 @@ async def scrape(payload: ScrapeRequest, request: Request):
         raise HTTPException(status_code=400, detail="Invalid URL domain")
 
     now_ts = int(time.time())
-    if not store.can_request_domain(domain, now_ts, min_interval_seconds=10):
+
+    # FIX: rate limit raised to 30 s (was 10 s).
+    # 10 s was too short — rapid re-analysis of the same domain within the
+    # scrape's own MIN_SCRAPE_SECONDS window would get 429'd, leaving the
+    # frontend with no fresh result.
+    if not store.can_request_domain(domain, now_ts, min_interval_seconds=30):
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded for domain {domain}. Allow 1 request per 10 seconds.",
+            detail=(
+                f"Rate limit: please wait 30 seconds before re-analysing {domain}. "
+                "This prevents serving a stale cached result."
+            ),
         )
 
     try:
         result = await scrape_url(url)
+        # FIX: save_history now uses INSERT OR REPLACE (upsert) so the DB
+        # always holds exactly one row per domain — the freshest result.
         store.save_history(url, domain, result)
         return JSONResponse(content=result)
     except HTTPException:

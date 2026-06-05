@@ -27,22 +27,23 @@ DENTAL_SERVICE_MIX = {
 }
 
 # Penalty applied to confidence when a derived field relies on another
-# predicted (not scraped) value.  Each additional prediction hop costs this.
+# predicted (not scraped) value.
 _PREDICTION_HOP_PENALTY = 0.12
 
-# Fields whose values are produced by prediction rather than scraping.
-# Maintained at module level; reset by the scraper at the start of each run
-# via `mark_predicted`.
+# Module-level set; MUST be reset at the start of each scrape_url call.
 _predicted_keys: set[str] = set()
 
 
 def reset_prediction_registry() -> None:
-    """Call at the start of each scrape_url invocation."""
+    """
+    MUST be called at the start of every scrape_url() invocation.
+    Without this, predicted keys from run N bleed into run N+1,
+    corrupting hop-penalty calculations across separate scrapes.
+    """
     _predicted_keys.clear()
 
 
 def mark_predicted(key: str) -> None:
-    """Register a key as predicted (not scraped) so dependents are penalised."""
     _predicted_keys.add(key)
 
 
@@ -51,10 +52,6 @@ def _is_predicted(key: str) -> bool:
 
 
 def _hop_penalty(*dep_keys: str) -> float:
-    """
-    Return the cumulative hop penalty for the given dependency keys.
-    Each predicted dependency adds one penalty unit.
-    """
     return _PREDICTION_HOP_PENALTY * sum(1 for k in dep_keys if _is_predicted(k))
 
 
@@ -107,30 +104,19 @@ def predict_numeric(
 ) -> Tuple[float | int, float, str]:
     """
     Returns (value, confidence, method).
-
-    ``scrape_ratio`` is len(scraped_fields) / total_fields from the scraper,
-    ranging 0–1.  Higher ratios → derived values earn higher confidence
-    because the inputs they rely on are more likely to be real.
-
-    Confidence is reduced by ``_hop_penalty`` for every dependency that was
-    itself predicted rather than scraped.  This prevents silent
-    prediction-of-prediction chains from appearing as confident as
-    derivations from real data.
     """
-    revenue  = known.get("revenue")
-    outlets  = known.get("number_of_outlets")
-    patients = known.get("total_patients")
-    visits_y = known.get("visit_frequency_per_patient_per_year")
-    doctors  = known.get("number_of_doctors")
-    dentists = known.get("number_of_dentists")
+    revenue    = known.get("revenue")
+    outlets    = known.get("number_of_outlets")
+    patients   = known.get("total_patients")
+    visits_y   = known.get("visit_frequency_per_patient_per_year")
+    doctors    = known.get("number_of_doctors")
+    dentists   = known.get("number_of_dentists")
     therapists = known.get("number_of_therapists")
-    rooms    = known.get("number_of_treatment_rooms")
-    chairs   = known.get("number_of_dental_chairs")
-    atv      = known.get("average_transaction_value")
+    rooms      = known.get("number_of_treatment_rooms")
+    chairs     = known.get("number_of_dental_chairs")
+    atv        = known.get("average_transaction_value")
 
-    # Scrape-ratio bonus: the more real data we have, the more we trust
-    # derivations that use it.
-    _sr_bonus = scrape_ratio * 0.08   # max +0.08 when everything was scraped
+    _sr_bonus = scrape_ratio * 0.08
 
     # ── Derived financial fields ──────────────────────────────────────────────
     if field == "revenue_per_outlet" and revenue and outlets:
@@ -166,13 +152,11 @@ def predict_numeric(
     # ── Margins ───────────────────────────────────────────────────────────────
     if field == "gross_margin":
         base, method = {
-            "skin":    (58.0, "skin clinic gross margin baseline"),
-            "dental":  (52.0, "dental clinic gross margin baseline"),
-            "both":    (55.0, "blended clinic gross margin baseline"),
+            "skin":   (58.0, "skin clinic gross margin baseline"),
+            "dental": (52.0, "dental clinic gross margin baseline"),
+            "both":   (55.0, "blended clinic gross margin baseline"),
         }.get(clinic_type, (50.0, "generic clinic gross margin baseline"))
-        conf = {
-            "skin": 0.72, "dental": 0.72, "both": 0.68,
-        }.get(clinic_type, 0.55) + _sr_bonus
+        conf = {"skin": 0.72, "dental": 0.72, "both": 0.68}.get(clinic_type, 0.55) + _sr_bonus
         return base, min(conf, 0.80), method
 
     if field == "ebitda_margin":
@@ -181,9 +165,7 @@ def predict_numeric(
             "dental": (18.0, "dental clinic EBITDA baseline"),
             "both":   (19.0, "blended EBITDA baseline"),
         }.get(clinic_type, (17.0, "generic EBITDA baseline"))
-        conf = {
-            "skin": 0.70, "dental": 0.70, "both": 0.66,
-        }.get(clinic_type, 0.52) + _sr_bonus
+        conf = {"skin": 0.70, "dental": 0.70, "both": 0.66}.get(clinic_type, 0.52) + _sr_bonus
         return base, min(conf, 0.78), method
 
     if field == "marketing_spend":
@@ -292,21 +274,19 @@ def predict_numeric(
 
     if field == "new_patients_per_month":
         if patients:
-            # patients itself may be predicted — apply penalty.
             conf = 0.45 - _hop_penalty("total_patients") + _sr_bonus
             return max(int(round(patients * 0.06 / 12)), 1), max(conf, 0.25), "6% annual growth proxy"
         return 120, 0.40 + _sr_bonus, "market growth baseline"
 
     if field == "total_patients":
         if revenue:
-            # atv is almost always predicted → penalise.
             used_atv = atv or (450_000 if clinic_type == "skin" else 300_000)
             est = max(int(round(revenue / max(used_atv, 1))), 1)
             conf = 0.52 - _hop_penalty("revenue", "average_transaction_value") + _sr_bonus
             return est, max(conf, 0.25), "revenue ÷ estimated average transaction value"
         return 5_000, 0.35 + _sr_bonus, "generic annual patient volume baseline"
 
-    # ── Count fields (site-size guesses) ─────────────────────────────────────
+    # ── Count fields ──────────────────────────────────────────────────────────
     if field == "number_of_outlets":
         return 1, 0.55 + _sr_bonus, "single-site default"
     if field == "number_of_doctors":
@@ -320,7 +300,6 @@ def predict_numeric(
     if field == "number_of_dental_chairs":
         return 3, 0.48 + _sr_bonus, "small dental chair baseline"
 
-    # Service mix predictions are handled separately in scraper.py.
     return 0, 0.0, "unhandled"
 
 
@@ -338,5 +317,4 @@ def service_mix_prediction(clinic_type: str) -> Dict[str, float]:
         for k, v in DENTAL_SERVICE_MIX.items():
             mix[k] = mix.get(k, 0.0) + v * 0.5
         return _scale_mix(mix)
-    # unknown: return combined un-blended mix
     return _scale_mix({**SKIN_SERVICE_MIX, **DENTAL_SERVICE_MIX})

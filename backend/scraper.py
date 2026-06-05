@@ -20,6 +20,8 @@ from predictor import (
     default_city_split,
     infer_clinic_type,
     predict_numeric,
+    reset_prediction_registry,   # FIX: was never imported/called
+    mark_predicted,
     service_mix_prediction,
 )
 
@@ -29,26 +31,50 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
-# ── Sub-page discovery ────────────────────────────────────────────────────────
-# Paths that typically contain high-value data for clinic sites.
-# Indonesian + English variants are both included.
 SUBPAGE_PATTERNS = [
-    # Staff / team
     "about", "about-us", "tentang", "tentang-kami", "team", "tim", "dokter",
     "doctor", "dentist", "therapist", "terapis", "our-team", "tim-dokter",
-    # Locations / outlets
     "location", "locations", "lokasi", "cabang", "outlet", "find-us",
     "clinic", "klinik", "our-clinic", "where-to-find",
-    # Services / pricing
     "service", "services", "layanan", "treatment", "treatments", "perawatan",
     "harga", "price", "pricing", "tarif", "paket", "package", "promo",
-    # Patients / results
     "patient", "pasien", "review", "testimonial", "testimoni", "hasil",
-    # Financial / investor (rare but gold)
     "investor", "press", "media", "news", "berita", "annual-report",
 ]
 
-MIN_SCRAPE_SECONDS = 14  # floor so sub-page crawl always gets time to finish
+MIN_SCRAPE_SECONDS = 14
+
+# ── Sanity bounds for scraped staff/count fields ──────────────────────────────
+# Any value outside these ranges is almost certainly a mis-parsed year,
+# copyright notice, phone number, or other incidental number on the page.
+_FIELD_SANITY: Dict[str, Tuple[int, int]] = {
+    "number_of_doctors":        (1,   500),
+    "number_of_dentists":       (1,   200),
+    "number_of_therapists":     (1,   500),
+    "number_of_treatment_rooms":(1,   100),
+    "number_of_dental_chairs":  (1,   100),
+    "number_of_outlets":        (1,   500),
+    "total_patients":           (10, 5_000_000),
+    "new_patients_per_month":   (1,  100_000),
+    "visit_frequency_per_patient_per_year": (1, 52),
+    "average_waiting_time":     (1,   180),   # minutes
+    "patient_per_doctor_per_day": (1,  80),
+    "patient_per_dentist_per_day": (1, 60),
+    "visits_per_chair_per_day": (1,   40),
+    "average_treatment_duration": (5, 240),   # minutes
+    "operating_days_per_year":  (50,  366),
+    "opening_hours_per_day":    (1,   24),
+}
+
+
+def _sanity_check(field: str, value: Any) -> bool:
+    """Return True if value is within acceptable bounds for the field."""
+    if field not in _FIELD_SANITY:
+        return True
+    if not isinstance(value, (int, float)):
+        return True
+    lo, hi = _FIELD_SANITY[field]
+    return lo <= value <= hi
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -57,18 +83,13 @@ def _base_headers() -> Dict[str, str]:
     return {
         "User-Agent": USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
+        "Expires": "0",
     }
 
 
 async def fetch_html_playwright(url: str, timeout_s: int = 30) -> Tuple[str, str]:
-    """
-    Fetch a page with a real Chromium browser.
-    Scrolls the full page so lazy-loaded / IntersectionObserver content
-    is triggered, then waits an extra 2 s for any resulting XHR to settle.
-    Returns (html, final_url).
-    """
     browser = None
     async with async_playwright() as p:
         try:
@@ -83,10 +104,7 @@ async def fetch_html_playwright(url: str, timeout_s: int = 30) -> Tuple[str, str
                 viewport={"width": 1366, "height": 900},
             )
             page = await ctx.new_page()
-
             await page.goto(url, wait_until="networkidle", timeout=timeout_s * 1000)
-
-            # Scroll in steps to trigger every IntersectionObserver on the page.
             await page.evaluate("""async () => {
                 await new Promise(resolve => {
                     const distance = 400;
@@ -103,10 +121,7 @@ async def fetch_html_playwright(url: str, timeout_s: int = 30) -> Tuple[str, str
                     }, delay);
                 });
             }""")
-
-            # Wait for any lazy XHR triggered by the scroll.
             await page.wait_for_timeout(2_000)
-
             html = await page.content()
             final_url = page.url
             return html, final_url
@@ -119,7 +134,6 @@ async def fetch_html_playwright(url: str, timeout_s: int = 30) -> Tuple[str, str
 
 
 async def fetch_html_httpx(url: str, timeout_s: int = 20) -> Tuple[str, str]:
-    """Lightweight fallback using httpx."""
     async with httpx.AsyncClient(
         headers=_base_headers(), follow_redirects=True, timeout=timeout_s
     ) as client:
@@ -129,17 +143,12 @@ async def fetch_html_httpx(url: str, timeout_s: int = 20) -> Tuple[str, str]:
 
 
 async def fetch_html(url: str, timeout_s: int = 30) -> Tuple[str, str, bool]:
-    """
-    Returns (html, final_url, used_playwright).
-    Tries Playwright first; falls back to httpx on any error.
-    """
     if async_playwright is not None:
         try:
             html, final_url = await fetch_html_playwright(url, timeout_s)
             return html, final_url, True
         except Exception:
             pass
-
     try:
         html, final_url = await fetch_html_httpx(url, timeout_s)
         return html, final_url, False
@@ -150,33 +159,22 @@ async def fetch_html(url: str, timeout_s: int = 30) -> Tuple[str, str, bool]:
 # ── Sub-page crawler ──────────────────────────────────────────────────────────
 
 def _is_subpage_candidate(href: str, base_netloc: str) -> bool:
-    """
-    Return True when href is an internal link that matches one of our
-    high-value path patterns, is not a file download, and is not the root.
-    """
     parsed = urlparse(href)
     if parsed.netloc and parsed.netloc.lower() != base_netloc:
-        return False  # external link
+        return False
     path = parsed.path.rstrip("/").lower()
     if not path or path == "/":
         return False
-    # Skip obvious non-HTML resources.
     if re.search(r"\.(pdf|jpg|jpeg|png|gif|svg|css|js|xml|zip|docx?)$", path):
         return False
-    # Must match at least one keyword in its path segments.
     segments = re.split(r"[/-]", path)
     return any(pat in segments or pat in path for pat in SUBPAGE_PATTERNS)
 
 
 def _discover_subpage_links(soup: BeautifulSoup, base_url: str) -> List[str]:
-    """
-    Return up to 10 candidate sub-page URLs discovered from <a href> tags.
-    Deduplicates by normalised path.
-    """
     base_netloc = urlparse(base_url).netloc.lower()
     seen_paths: Set[str] = set()
     candidates: List[str] = []
-
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
@@ -190,16 +188,10 @@ def _discover_subpage_links(soup: BeautifulSoup, base_url: str) -> List[str]:
             candidates.append(absolute)
         if len(candidates) >= 10:
             break
-
     return candidates
 
 
 async def _fetch_subpage_text(url: str) -> str:
-    """
-    Fetch a sub-page and return its cleaned plain text.
-    Uses httpx only (no Playwright) to keep sub-page fetching fast.
-    Returns empty string on any error.
-    """
     try:
         html, _ = await fetch_html_httpx(url, timeout_s=12)
         soup = BeautifulSoup(html, "lxml")
@@ -209,25 +201,16 @@ async def _fetch_subpage_text(url: str) -> str:
 
 
 async def crawl_subpages(root_soup: BeautifulSoup, root_url: str) -> str:
-    """
-    Discover and concurrently fetch the most relevant sub-pages.
-    Returns a single merged text string ready for field extraction.
-    """
     candidates = _discover_subpage_links(root_soup, root_url)
     if not candidates:
         return ""
-
     tasks = [_fetch_subpage_text(u) for u in candidates]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    parts = []
-    for r in results:
-        if isinstance(r, str) and r:
-            parts.append(r)
+    parts = [r for r in results if isinstance(r, str) and r]
     return " ".join(parts)
 
 
-# ── Text / structure helpers ──────────────────────────────────────────────────
+# ── Text helpers ──────────────────────────────────────────────────────────────
 
 def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -268,13 +251,7 @@ def _jsonld_objects(soup: BeautifulSoup) -> List[Dict[str, Any]]:
 
 
 def _extract_tables(soup: BeautifulSoup) -> str:
-    """
-    Extract text from <table>, <dl>, and <ul>/<ol> list elements separately
-    before the page is flattened. Tables often hold pricing / staff data
-    that is easy to regex once linearised as 'key :: value' pairs.
-    """
     parts: List[str] = []
-
     for table in soup.find_all("table"):
         rows: List[str] = []
         for tr in table.find_all("tr"):
@@ -283,13 +260,11 @@ def _extract_tables(soup: BeautifulSoup) -> str:
                 rows.append(" :: ".join(cells))
         if rows:
             parts.append(" | ".join(rows))
-
     for dl in soup.find_all("dl"):
         dts = [_clean_text(dt.get_text(" ", strip=True)) for dt in dl.find_all("dt")]
         dds = [_clean_text(dd.get_text(" ", strip=True)) for dd in dl.find_all("dd")]
         for dt, dd in zip(dts, dds):
             parts.append(f"{dt} :: {dd}")
-
     return " ".join(parts)
 
 
@@ -311,7 +286,6 @@ def _currency_to_idr(text: str) -> Optional[float]:
         num, unit = float(m.group(1)), m.group(2)
     else:
         num, unit = float(m.group(2)), m.group(3)
-
     mult = 1.0
     if unit in {"miliar", "b", "bn"}:
         mult = 1_000_000_000.0
@@ -344,6 +318,15 @@ def _int_from_text(text: str) -> Optional[int]:
         return None
 
 
+# FIX: year-pattern pre-compiled once — used to strip years before int extraction
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def _strip_years(text: str) -> str:
+    """Remove calendar years (1900–2099) so they can't be parsed as counts."""
+    return _YEAR_RE.sub("", text)
+
+
 def _find_context_value(
     text: str, aliases: List[str], value_type: str
 ) -> Optional[Any]:
@@ -356,7 +339,8 @@ def _find_context_value(
             elif value_type == "percent":
                 val = _percent_from_text(chunk)
             else:
-                val = _int_from_text(chunk)
+                # FIX: strip years before trying to parse an integer count
+                val = _int_from_text(_strip_years(chunk))
             if val is not None:
                 return val
     return None
@@ -419,10 +403,6 @@ _INT_FIELDS = {
 
 
 def extract_fields_from_text(text: str) -> Dict[str, Any]:
-    """
-    Extract numeric fields from arbitrary text using context windows.
-    Works on body text, table linearisations, meta strings, and JSON-LD dumps.
-    """
     out: Dict[str, Any] = {}
     text_clean = _clean_text(text)
 
@@ -433,10 +413,12 @@ def extract_fields_from_text(text: str) -> Dict[str, Any]:
             val = _find_context_value(text_clean, aliases, "percent")
         else:
             val = _find_context_value(text_clean, aliases, "int")
-        if val is not None:
-            out[field] = val
 
-    # Catch bare "IDR X.XB" / "Rp X miliar" revenue mentions not near a keyword.
+        if val is not None:
+            # FIX: reject values outside plausible real-world bounds
+            if _sanity_check(field, val):
+                out[field] = val
+
     if "revenue" not in out:
         rev = _currency_to_idr(text_clean)
         if rev and rev > 100_000:
@@ -595,8 +577,6 @@ def _get_by_path(schema: Dict[str, Any], path: str) -> Any:
     return cur
 
 
-# ── Path → field key mappings ─────────────────────────────────────────────────
-
 _PATH_ALIAS_MAP: Dict[str, str] = {
     "financials.revenue": "revenue",
     "financials.number_of_outlets": "number_of_outlets",
@@ -643,21 +623,25 @@ _PATH_ALIAS_MAP: Dict[str, str] = {
 async def scrape_url(url: str) -> Dict[str, Any]:
     t_start = time.monotonic()
 
-    # ── 1. Fetch root page (Playwright with scroll) ───────────────────────────
+    # ── FIX: Reset prediction registry at the START of every run ─────────────
+    # Without this, _predicted_keys from the previous scrape_url() call bleeds
+    # into this one, causing wrong hop-penalty calculations and stale state.
+    reset_prediction_registry()
+
+    # ── 1. Fetch root page ────────────────────────────────────────────────────
     html, final_url, used_playwright = await fetch_html(url)
     soup = BeautifulSoup(html, "lxml")
 
-    root_text     = _clean_text(soup.get_text(" ", strip=True))
-    table_text    = _extract_tables(soup)
-    page_title    = _page_title(soup)
-    meta          = _extract_meta(soup)
-    jsonlds       = _jsonld_objects(soup)
+    root_text  = _clean_text(soup.get_text(" ", strip=True))
+    table_text = _extract_tables(soup)
+    page_title = _page_title(soup)
+    meta       = _extract_meta(soup)
+    jsonlds    = _jsonld_objects(soup)
 
-    # ── 2. Crawl sub-pages concurrently ──────────────────────────────────────
+    # ── 2. Crawl sub-pages ────────────────────────────────────────────────────
     subpage_candidates = _discover_subpage_links(soup, final_url or url)
     subpage_text = await crawl_subpages(soup, final_url or url)
 
-    # Merged corpus: root body + tables + sub-pages + meta + JSON-LD
     full_text = " ".join(filter(None, [
         root_text,
         table_text,
@@ -668,54 +652,58 @@ async def scrape_url(url: str) -> Dict[str, Any]:
 
     pages_crawled = 1 + len(subpage_candidates)
 
-    # ── 3. Clinic type from full corpus ──────────────────────────────────────
+    # ── 3. Clinic type ────────────────────────────────────────────────────────
     clinic_type = infer_clinic_type(f"{page_title} {full_text}", url=url)
 
-    # ── 4. Field extraction from merged corpus ────────────────────────────────
+    # ── 4. Field extraction ───────────────────────────────────────────────────
     observed: Dict[str, Any] = {}
-
-    # Run extraction on the full merged text first (highest recall),
-    # then separately on table linearisations (highest precision for numbers).
     observed.update(extract_fields_from_text(full_text))
     observed.update(extract_fields_from_text(table_text))  # tables win on conflicts
 
-    # Specific structural patterns that regex on raw text misses.
+    # Structural patterns missed by generic regex.
     if "number_of_outlets" not in observed:
         for kw in ("outlet", "cabang", "branch", "lokasi", "location"):
             m = re.search(rf"([0-9]+)\s+{kw}s?\b", full_text, flags=re.I)
             if m:
-                observed["number_of_outlets"] = int(m.group(1))
+                val = int(m.group(1))
+                if _sanity_check("number_of_outlets", val):
+                    observed["number_of_outlets"] = val
                 break
 
     if "number_of_dental_chairs" not in observed and clinic_type in {"dental", "both"}:
         m = re.search(r"([0-9]+)\s+(dental chairs?|chairs?|unit dental)\b", full_text, flags=re.I)
         if m:
-            observed["number_of_dental_chairs"] = int(m.group(1))
+            val = int(m.group(1))
+            if _sanity_check("number_of_dental_chairs", val):
+                observed["number_of_dental_chairs"] = val
 
-    # Staff count from "X dokter" / "X dentists" pattern.
+    # FIX: year-stripped staff patterns
     for field, pattern in [
         ("number_of_doctors",    r"([0-9]+)\s+(doctor|dokter|physician)s?\b"),
         ("number_of_dentists",   r"([0-9]+)\s+(dentist|dokter gigi|drg)s?\b"),
         ("number_of_therapists", r"([0-9]+)\s+(therapist|terapis)s?\b"),
     ]:
         if field not in observed:
-            m = re.search(pattern, full_text, flags=re.I)
+            # Strip years from text before applying staff-count patterns
+            clean_for_staff = _strip_years(full_text)
+            m = re.search(pattern, clean_for_staff, flags=re.I)
             if m:
-                observed[field] = int(m.group(1))
+                val = int(m.group(1))
+                if _sanity_check(field, val):
+                    observed[field] = val
 
     # ── 5. Build schema ───────────────────────────────────────────────────────
     schema = make_base_schema()
-    schema["metadata"]["url"]          = final_url or url
-    schema["metadata"]["page_title"]   = page_title
-    schema["metadata"]["scraped_at"]   = utc_now_iso()
-    schema["metadata"]["clinic_type"]  = clinic_type
+    schema["metadata"]["url"]           = final_url or url
+    schema["metadata"]["page_title"]    = page_title
+    schema["metadata"]["scraped_at"]    = utc_now_iso()
+    schema["metadata"]["clinic_type"]   = clinic_type
     schema["metadata"]["pages_crawled"] = pages_crawled
     schema["metadata"]["subpages_found"] = subpage_candidates
 
     scraped_fields: Dict[str, float] = {}
     predictions_log: List[Dict[str, Any]] = []
 
-    # Populate scraped values.
     for path, key in _PATH_ALIAS_MAP.items():
         if key in observed and observed[key] is not None:
             val = observed[key]
@@ -723,6 +711,7 @@ async def scrape_url(url: str) -> Dict[str, Any]:
                 val = round(val, 2)
             _set_by_path(schema, path, field_object(val, "scraped", 0.90))
             scraped_fields[path] = 0.90
+            # Do NOT mark scraped fields as predicted.
 
     # ── 6. Patient mix from text signals ─────────────────────────────────────
     mix_text = full_text.lower()
@@ -762,15 +751,13 @@ async def scrape_url(url: str) -> Dict[str, Any]:
                                 known_flat[f"{k}.{kk}"] = vv["value"]
 
     collect_known()
-
-    # Scraped field ratio — used by predictor to scale baseline confidences.
     scrape_ratio = len(scraped_fields) / max(len(_PATH_ALIAS_MAP), 1)
 
     # ── 9. Prediction engine ──────────────────────────────────────────────────
     def fill_numeric(path: str, key: str, unit: Optional[str] = None) -> None:
         current = _get_by_path(schema, path)
         if isinstance(current, dict) and current.get("source") == "scraped":
-            return  # never overwrite a scraped value
+            return
         value, confidence, method = predict_numeric(
             field=key,
             clinic_type=clinic_type,
@@ -781,6 +768,8 @@ async def scrape_url(url: str) -> Dict[str, Any]:
         if confidence > 0:
             _set_by_path(schema, path, field_object(value, "predicted", confidence, unit=unit))
             known_flat[key] = value
+            # FIX: mark this key as predicted so downstream derivations are penalised
+            mark_predicted(key)
             predictions_log.append({
                 "field": path,
                 "method": method,
@@ -879,20 +868,12 @@ async def scrape_url(url: str) -> Dict[str, Any]:
         for k, v in service_mix.items():
             if k in schema["service_mix_skin"] and schema["service_mix_skin"][k] is None:
                 schema["service_mix_skin"][k] = field_object(v, "predicted", svc_conf)
-                predictions_log.append({
-                    "field": f"service_mix_skin.{k}",
-                    "method": f"{clinic_type} service mix baseline",
-                    "confidence": svc_conf,
-                })
+                predictions_log.append({"field": f"service_mix_skin.{k}", "method": f"{clinic_type} service mix baseline", "confidence": svc_conf})
     if clinic_type in {"dental", "both", "unknown"}:
         for k, v in service_mix.items():
             if k in schema["service_mix_dental"] and schema["service_mix_dental"][k] is None:
                 schema["service_mix_dental"][k] = field_object(v, "predicted", svc_conf)
-                predictions_log.append({
-                    "field": f"service_mix_dental.{k}",
-                    "method": f"{clinic_type} service mix baseline",
-                    "confidence": svc_conf,
-                })
+                predictions_log.append({"field": f"service_mix_dental.{k}", "method": f"{clinic_type} service mix baseline", "confidence": svc_conf})
 
     # ── 12. Patient mix fallbacks ─────────────────────────────────────────────
     if schema["patient_mix"]["new_vs_repeat_patient_mix"] is None:
@@ -929,17 +910,9 @@ async def scrape_url(url: str) -> Dict[str, Any]:
                     "service_mix_skin", "service_mix_dental"):
         walk(schema[section])
 
-    # Weighted confidence: scraped fields count double.
-    weighted_sum = sum(
-        (2.0 if path in scraped_fields else 1.0) * scraped_fields.get(path, 0.0)
-        for path in [*scraped_fields]
-    )
     if total_leaf > 0:
         raw_mean = conf_sum / total_leaf
-        # Boost by scrape_ratio so more scraped data → higher overall confidence.
-        overall_confidence = round(
-            min(raw_mean + scrape_ratio * 0.10, 0.97), 3
-        )
+        overall_confidence = round(min(raw_mean + scrape_ratio * 0.10, 0.97), 3)
     else:
         overall_confidence = 0.0
 
