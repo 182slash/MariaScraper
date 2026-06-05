@@ -3,16 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 try:
     from playwright.async_api import async_playwright
-except Exception:  # pragma: no cover - optional in environments without Playwright runtime
+except Exception:
     async_playwright = None  # type: ignore
 
 from models import field_object, utc_now_iso
@@ -29,15 +29,472 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
-SKIN_KEYWORDS = [
-    "skin", "skincare", "aesthetic", "beauty", "derma", "dermatology",
-    "acne", "facial", "botox", "filler", "threadlift", "laser", "hair removal",
-]
-DENTAL_KEYWORDS = [
-    "dental", "dentist", "dentistry", "gigi", "orthodont", "braces", "veneer",
-    "implant", "implan", "scaling", "endodont", "periodont", "prosthodont", "pedodont",
+# ── Sub-page discovery ────────────────────────────────────────────────────────
+# Paths that typically contain high-value data for clinic sites.
+# Indonesian + English variants are both included.
+SUBPAGE_PATTERNS = [
+    # Staff / team
+    "about", "about-us", "tentang", "tentang-kami", "team", "tim", "dokter",
+    "doctor", "dentist", "therapist", "terapis", "our-team", "tim-dokter",
+    # Locations / outlets
+    "location", "locations", "lokasi", "cabang", "outlet", "find-us",
+    "clinic", "klinik", "our-clinic", "where-to-find",
+    # Services / pricing
+    "service", "services", "layanan", "treatment", "treatments", "perawatan",
+    "harga", "price", "pricing", "tarif", "paket", "package", "promo",
+    # Patients / results
+    "patient", "pasien", "review", "testimonial", "testimoni", "hasil",
+    # Financial / investor (rare but gold)
+    "investor", "press", "media", "news", "berita", "annual-report",
 ]
 
+MIN_SCRAPE_SECONDS = 14  # floor so sub-page crawl always gets time to finish
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _base_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+async def fetch_html_playwright(url: str, timeout_s: int = 30) -> Tuple[str, str]:
+    """
+    Fetch a page with a real Chromium browser.
+    Scrolls the full page so lazy-loaded / IntersectionObserver content
+    is triggered, then waits an extra 2 s for any resulting XHR to settle.
+    Returns (html, final_url).
+    """
+    browser = None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = await browser.new_context(
+                user_agent=USER_AGENT,
+                locale="en-US",
+                extra_http_headers=_base_headers(),
+                viewport={"width": 1366, "height": 900},
+            )
+            page = await ctx.new_page()
+
+            await page.goto(url, wait_until="networkidle", timeout=timeout_s * 1000)
+
+            # Scroll in steps to trigger every IntersectionObserver on the page.
+            await page.evaluate("""async () => {
+                await new Promise(resolve => {
+                    const distance = 400;
+                    const delay    = 120;
+                    let   scrolled = 0;
+                    const timer = setInterval(() => {
+                        window.scrollBy(0, distance);
+                        scrolled += distance;
+                        if (scrolled >= document.body.scrollHeight) {
+                            clearInterval(timer);
+                            window.scrollTo(0, 0);
+                            resolve();
+                        }
+                    }, delay);
+                });
+            }""")
+
+            # Wait for any lazy XHR triggered by the scroll.
+            await page.wait_for_timeout(2_000)
+
+            html = await page.content()
+            final_url = page.url
+            return html, final_url
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+
+async def fetch_html_httpx(url: str, timeout_s: int = 20) -> Tuple[str, str]:
+    """Lightweight fallback using httpx."""
+    async with httpx.AsyncClient(
+        headers=_base_headers(), follow_redirects=True, timeout=timeout_s
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.text, str(resp.url)
+
+
+async def fetch_html(url: str, timeout_s: int = 30) -> Tuple[str, str, bool]:
+    """
+    Returns (html, final_url, used_playwright).
+    Tries Playwright first; falls back to httpx on any error.
+    """
+    if async_playwright is not None:
+        try:
+            html, final_url = await fetch_html_playwright(url, timeout_s)
+            return html, final_url, True
+        except Exception:
+            pass
+
+    try:
+        html, final_url = await fetch_html_httpx(url, timeout_s)
+        return html, final_url, False
+    except Exception:
+        return "", url, False
+
+
+# ── Sub-page crawler ──────────────────────────────────────────────────────────
+
+def _is_subpage_candidate(href: str, base_netloc: str) -> bool:
+    """
+    Return True when href is an internal link that matches one of our
+    high-value path patterns, is not a file download, and is not the root.
+    """
+    parsed = urlparse(href)
+    if parsed.netloc and parsed.netloc.lower() != base_netloc:
+        return False  # external link
+    path = parsed.path.rstrip("/").lower()
+    if not path or path == "/":
+        return False
+    # Skip obvious non-HTML resources.
+    if re.search(r"\.(pdf|jpg|jpeg|png|gif|svg|css|js|xml|zip|docx?)$", path):
+        return False
+    # Must match at least one keyword in its path segments.
+    segments = re.split(r"[/-]", path)
+    return any(pat in segments or pat in path for pat in SUBPAGE_PATTERNS)
+
+
+def _discover_subpage_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+    """
+    Return up to 10 candidate sub-page URLs discovered from <a href> tags.
+    Deduplicates by normalised path.
+    """
+    base_netloc = urlparse(base_url).netloc.lower()
+    seen_paths: Set[str] = set()
+    candidates: List[str] = []
+
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        absolute = urljoin(base_url, href)
+        path = urlparse(absolute).path.rstrip("/").lower() or "/"
+        if path in seen_paths:
+            continue
+        if _is_subpage_candidate(absolute, base_netloc):
+            seen_paths.add(path)
+            candidates.append(absolute)
+        if len(candidates) >= 10:
+            break
+
+    return candidates
+
+
+async def _fetch_subpage_text(url: str) -> str:
+    """
+    Fetch a sub-page and return its cleaned plain text.
+    Uses httpx only (no Playwright) to keep sub-page fetching fast.
+    Returns empty string on any error.
+    """
+    try:
+        html, _ = await fetch_html_httpx(url, timeout_s=12)
+        soup = BeautifulSoup(html, "lxml")
+        return _clean_text(soup.get_text(" ", strip=True))
+    except Exception:
+        return ""
+
+
+async def crawl_subpages(root_soup: BeautifulSoup, root_url: str) -> str:
+    """
+    Discover and concurrently fetch the most relevant sub-pages.
+    Returns a single merged text string ready for field extraction.
+    """
+    candidates = _discover_subpage_links(root_soup, root_url)
+    if not candidates:
+        return ""
+
+    tasks = [_fetch_subpage_text(u) for u in candidates]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    parts = []
+    for r in results:
+        if isinstance(r, str) and r:
+            parts.append(r)
+    return " ".join(parts)
+
+
+# ── Text / structure helpers ──────────────────────────────────────────────────
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _domain(url: str) -> str:
+    return urlparse(url).netloc.lower()
+
+
+def _page_title(soup: BeautifulSoup) -> str:
+    if soup.title and soup.title.get_text(strip=True):
+        return _clean_text(soup.title.get_text(" ", strip=True))
+    return ""
+
+
+def _extract_meta(soup: BeautifulSoup) -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    for tag in soup.find_all("meta"):
+        key = tag.get("property") or tag.get("name")
+        content = tag.get("content")
+        if key and content:
+            data[key.lower()] = content.strip()
+    return data
+
+
+def _jsonld_objects(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.get_text(strip=True))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+        elif isinstance(data, list):
+            out.extend(x for x in data if isinstance(x, dict))
+    return out
+
+
+def _extract_tables(soup: BeautifulSoup) -> str:
+    """
+    Extract text from <table>, <dl>, and <ul>/<ol> list elements separately
+    before the page is flattened. Tables often hold pricing / staff data
+    that is easy to regex once linearised as 'key :: value' pairs.
+    """
+    parts: List[str] = []
+
+    for table in soup.find_all("table"):
+        rows: List[str] = []
+        for tr in table.find_all("tr"):
+            cells = [_clean_text(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+            if cells:
+                rows.append(" :: ".join(cells))
+        if rows:
+            parts.append(" | ".join(rows))
+
+    for dl in soup.find_all("dl"):
+        dts = [_clean_text(dt.get_text(" ", strip=True)) for dt in dl.find_all("dt")]
+        dds = [_clean_text(dd.get_text(" ", strip=True)) for dd in dl.find_all("dd")]
+        for dt, dd in zip(dts, dds):
+            parts.append(f"{dt} :: {dd}")
+
+    return " ".join(parts)
+
+
+# ── Value parsers ─────────────────────────────────────────────────────────────
+
+def _currency_to_idr(text: str) -> Optional[float]:
+    if not text:
+        return None
+    s = text.lower().replace(",", "").replace(" ", "")
+    m = re.search(
+        r"(rp|idr)\s*([0-9]+(?:\.[0-9]+)?)\s*(miliar|million|jt|juta|rb|ribu|k|b|bn|m)?", s
+    )
+    if not m:
+        m = re.search(
+            r"([0-9]+(?:\.[0-9]+)?)\s*(miliar|million|jt|juta|rb|ribu|k|b|bn|m)\b", s
+        )
+        if not m:
+            return None
+        num, unit = float(m.group(1)), m.group(2)
+    else:
+        num, unit = float(m.group(2)), m.group(3)
+
+    mult = 1.0
+    if unit in {"miliar", "b", "bn"}:
+        mult = 1_000_000_000.0
+    elif unit in {"million", "m"}:
+        mult = 1_000_000.0
+    elif unit in {"jt", "juta"}:
+        mult = 1_000_000.0
+    elif unit in {"rb", "ribu", "k"}:
+        mult = 1_000.0
+    return num * mult
+
+
+def _percent_from_text(text: str) -> Optional[float]:
+    if not text:
+        return None
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", text)
+    return float(m.group(1)) if m else None
+
+
+def _int_from_text(text: str) -> Optional[int]:
+    if not text:
+        return None
+    s = text.lower().replace(",", "")
+    m = re.search(r"([0-9]{1,3}(?:\.[0-9]{3})+|[0-9]+)", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(".", ""))
+    except ValueError:
+        return None
+
+
+def _find_context_value(
+    text: str, aliases: List[str], value_type: str
+) -> Optional[Any]:
+    for alias in aliases:
+        pattern = rf"({re.escape(alias)}[^.\n:{{}}]{{0,180}})"
+        for m in re.finditer(pattern, text, flags=re.I):
+            chunk = m.group(1)
+            if value_type == "currency":
+                val = _currency_to_idr(chunk)
+            elif value_type == "percent":
+                val = _percent_from_text(chunk)
+            else:
+                val = _int_from_text(chunk)
+            if val is not None:
+                return val
+    return None
+
+
+# ── Field extraction ──────────────────────────────────────────────────────────
+
+_ALIASES: Dict[str, List[str]] = {
+    "revenue": ["revenue", "pendapatan", "omzet", "sales", "turnover"],
+    "number_of_outlets": ["outlet", "cabang", "branch", "clinic", "klinik"],
+    "number_of_doctors": ["doctor", "dokter", "physician", "medical team", "tim dokter"],
+    "number_of_dentists": ["dentist", "dokter gigi", "drg", "dokter gigi kami"],
+    "number_of_therapists": ["therapist", "terapis", "aesthetic therapist", "beauty therapist"],
+    "number_of_treatment_rooms": ["treatment room", "ruang perawatan", "ruangan tindakan"],
+    "number_of_dental_chairs": ["dental chair", "chair", "kursi dental", "unit dental"],
+    "total_patients": ["patients", "pasien", "patient", "total pasien"],
+    "new_patients_per_month": ["new patients", "pasien baru", "new patient per month"],
+    "patient_retention_rate": ["retention", "repeat", "returning patient", "pasien setia"],
+    "visit_frequency_per_patient_per_year": ["visit frequency", "kunjungan per pasien", "visits per patient"],
+    "nps_score": ["nps", "net promoter score"],
+    "average_waiting_time": ["waiting time", "waktu tunggu", "antrian"],
+    "doctor_utilization": ["utilization", "occupancy", "utilisasi"],
+    "patient_per_doctor_per_day": ["patients per doctor per day", "pasien per dokter"],
+    "dentist_utilization": ["dentist utilization"],
+    "chair_utilization": ["chair utilization", "utilisasi kursi"],
+    "visits_per_chair_per_day": ["visits per chair per day"],
+    "patient_per_dentist_per_day": ["patients per dentist per day"],
+    "average_treatment_duration": ["treatment duration", "durasi tindakan", "lama perawatan"],
+    "appointment_slot_utilization": ["appointment slot utilization"],
+    "customer_acquisition_cost_cac": ["cac", "customer acquisition cost", "biaya akuisisi"],
+    "customer_lifetime_value_ltv": ["ltv", "lifetime value", "nilai seumur hidup"],
+    "ebitda_margin": ["ebitda margin", "ebitda"],
+    "gross_margin": ["gross margin", "margin kotor"],
+    "average_transaction_value": ["average transaction value", "atv", "nilai transaksi rata"],
+    "membership_package_penetration": ["membership", "package penetration", "paket member"],
+    "marketing_spend": ["marketing spend", "marketing expense", "biaya pemasaran", "biaya iklan"],
+    "investment_per_clinic": ["investment", "capex", "fit out", "investasi klinik"],
+}
+
+_CURRENCY_FIELDS = {
+    "revenue", "revenue_per_outlet", "revenue_per_city",
+    "revenue_per_patient", "revenue_per_visit",
+    "revenue_per_doctor_dentist_therapist", "revenue_per_treatment_room",
+    "revenue_per_dental_chair", "customer_acquisition_cost_cac",
+    "customer_lifetime_value_ltv", "average_transaction_value", "investment_per_clinic",
+}
+_PERCENT_FIELDS = {
+    "doctor_utilization", "dentist_utilization", "chair_utilization",
+    "patient_retention_rate", "nps_score", "appointment_slot_utilization",
+    "membership_package_penetration", "marketing_spend",
+}
+_INT_FIELDS = {
+    "number_of_outlets", "number_of_doctors", "number_of_dentists",
+    "number_of_therapists", "number_of_treatment_rooms", "number_of_dental_chairs",
+    "patient_per_doctor_per_day", "patient_per_dentist_per_day",
+    "visits_per_chair_per_day", "new_patients_per_month", "total_patients",
+    "average_waiting_time", "visit_frequency_per_patient_per_year",
+    "average_treatment_duration", "operating_days_per_year", "opening_hours_per_day",
+}
+
+
+def extract_fields_from_text(text: str) -> Dict[str, Any]:
+    """
+    Extract numeric fields from arbitrary text using context windows.
+    Works on body text, table linearisations, meta strings, and JSON-LD dumps.
+    """
+    out: Dict[str, Any] = {}
+    text_clean = _clean_text(text)
+
+    for field, aliases in _ALIASES.items():
+        if field in _CURRENCY_FIELDS:
+            val = _find_context_value(text_clean, aliases, "currency")
+        elif field in _PERCENT_FIELDS:
+            val = _find_context_value(text_clean, aliases, "percent")
+        else:
+            val = _find_context_value(text_clean, aliases, "int")
+        if val is not None:
+            out[field] = val
+
+    # Catch bare "IDR X.XB" / "Rp X miliar" revenue mentions not near a keyword.
+    if "revenue" not in out:
+        rev = _currency_to_idr(text_clean)
+        if rev and rev > 100_000:
+            out["revenue"] = rev
+
+    return out
+
+
+def _extract_service_mix_terms(text: str, clinic_type: str) -> Dict[str, Any]:
+    t = text.lower()
+    out: Dict[str, Any] = {}
+    if clinic_type in {"skin", "both"}:
+        for field, kws in {
+            "skin_health_pct": ["skin", "acne", "facial", "glow", "derma"],
+            "injectables_antiaging_pct": ["botox", "filler", "threadlift", "injectable"],
+            "body_aesthetics_pct": ["slimming", "body", "whitening"],
+            "hair_solutions_pct": ["hair treatment", "hair loss"],
+            "non_doctor_treatments_pct": ["therapist", "non-doctor", "non doctor"],
+        }.items():
+            if any(k in t for k in kws):
+                out[field] = None
+    if clinic_type in {"dental", "both"}:
+        for field, kws in {
+            "scaling_pct": ["scaling"],
+            "fillings_pct": ["filling", "tambal"],
+            "braces_pct": ["braces", "orthodont", "behel"],
+            "veneers_pct": ["veneer"],
+            "endodontics_pct": ["endodont", "saluran akar"],
+            "periodontics_pct": ["periodont", "gusi"],
+            "prosthodontics_pct": ["prosthodont", "gigi tiruan"],
+            "pedodontics_pct": ["pedodont", "gigi anak"],
+        }.items():
+            if any(k in t for k in kws):
+                out[field] = None
+    return out
+
+
+def _detect_city_presence(text: str) -> Dict[str, float]:
+    t = text.lower()
+    weights: Dict[str, float] = {}
+    if "jakarta" in t:
+        weights["dki_jakarta"] = 70.0
+    if "surabaya" in t:
+        weights["surabaya"] = 70.0
+    if any(w in t for w in ("banten", "tangerang", "bsd", "serpong")):
+        weights["banten"] = 70.0
+    if not weights:
+        return default_city_split()
+    remaining = 100.0 - sum(weights.values())
+    missing = [k for k in ("dki_jakarta", "surabaya", "banten") if k not in weights]
+    if missing:
+        share = max(remaining, 0.0) / len(missing)
+        for k in missing:
+            weights[k] = round(share, 2)
+    return weights
+
+
+# ── Schema helpers ────────────────────────────────────────────────────────────
 
 def make_base_schema() -> Dict[str, Any]:
     return {
@@ -45,11 +502,7 @@ def make_base_schema() -> Dict[str, Any]:
             "revenue": None,
             "number_of_outlets": None,
             "revenue_per_outlet": None,
-            "revenue_per_city": {
-                "dki_jakarta": None,
-                "surabaya": None,
-                "banten": None,
-            },
+            "revenue_per_city": {"dki_jakarta": None, "surabaya": None, "banten": None},
             "revenue_per_patient": None,
             "revenue_per_visit": None,
             "revenue_per_doctor_dentist_therapist": None,
@@ -121,361 +574,10 @@ def make_base_schema() -> Dict[str, Any]:
             "url": "",
             "page_title": "",
             "overall_confidence": 0.0,
+            "pages_crawled": 0,
+            "subpages_found": [],
         },
     }
-
-
-def _domain(url: str) -> str:
-    return urlparse(url).netloc.lower()
-
-
-def _clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def _currency_to_idr(text: str) -> Optional[float]:
-    if not text:
-        return None
-    s = text.lower().replace(",", "").replace(" ", "")
-    m = re.search(r"(rp|idr)\s*([0-9]+(?:\.[0-9]+)?)\s*(miliar|million|jt|juta|rb|ribu|k|b|bn|m)?", s)
-    if not m:
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(miliar|million|jt|juta|rb|ribu|k|b|bn|m)\b", s)
-        if not m:
-            return None
-        num = float(m.group(1))
-        unit = m.group(2)
-    else:
-        num = float(m.group(2))
-        unit = m.group(3)
-    mult = 1.0
-    if unit in {"miliar", "b", "bn"}:
-        mult = 1_000_000_000.0
-    elif unit in {"million", "m"}:
-        mult = 1_000_000.0
-    elif unit in {"jt", "juta", "k"}:
-        mult = 1_000_000.0 if unit in {"jt", "juta"} else 1_000.0
-    elif unit in {"rb", "ribu"}:
-        mult = 1_000.0
-    return num * mult
-
-
-def _percent_from_text(text: str) -> Optional[float]:
-    if not text:
-        return None
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", text)
-    if m:
-        return float(m.group(1))
-    return None
-
-
-def _int_from_text(text: str) -> Optional[int]:
-    if not text:
-        return None
-    s = text.lower().replace(",", "")
-    m = re.search(r"([0-9]{1,3}(?:\.[0-9]{3})+|[0-9]+)", s)
-    if not m:
-        return None
-    num = m.group(1).replace(".", "")
-    try:
-        return int(num)
-    except ValueError:
-        return None
-
-
-def _find_context_value(text: str, aliases: List[str], value_type: str) -> Optional[Any]:
-    for alias in aliases:
-        pattern = rf"({re.escape(alias)}[^.\n:{{}}]{{0,140}})"
-        for m in re.finditer(pattern, text, flags=re.I):
-            chunk = m.group(1)
-            if value_type == "currency":
-                val = _currency_to_idr(chunk)
-                if val is not None:
-                    return val
-            elif value_type == "percent":
-                val = _percent_from_text(chunk)
-                if val is not None:
-                    return val
-            else:
-                val = _int_from_text(chunk)
-                if val is not None:
-                    return val
-    return None
-
-
-def _jsonld_objects(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(script.get_text(strip=True))
-        except Exception:
-            continue
-        if isinstance(data, dict):
-            out.append(data)
-        elif isinstance(data, list):
-            out.extend([x for x in data if isinstance(x, dict)])
-    return out
-
-
-def _extract_meta(soup: BeautifulSoup) -> Dict[str, str]:
-    data = {}
-    for tag in soup.find_all("meta"):
-        key = tag.get("property") or tag.get("name")
-        content = tag.get("content")
-        if key and content:
-            data[key.lower()] = content.strip()
-    return data
-
-
-def _page_title(soup: BeautifulSoup) -> str:
-    if soup.title and soup.title.get_text(strip=True):
-        return _clean_text(soup.title.get_text(" ", strip=True))
-    return ""
-
-
-async def fetch_html(url: str, timeout_s: int = 30) -> Tuple[str, str, bool]:
-    """
-    Returns (html, final_url, used_playwright)
-    """
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-    if async_playwright is not None:
-        browser = None
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"],
-                )
-                page = await browser.new_page(
-                    user_agent=USER_AGENT,
-                    locale="en-US",
-                    extra_http_headers=headers,
-                    viewport={"width": 1366, "height": 900},
-                )
-                await page.goto(url, wait_until="networkidle", timeout=timeout_s * 1000)
-                html = await page.content()
-                final_url = page.url
-                await browser.close()
-                return html, final_url, True
-        except Exception:
-            try:
-                if browser is not None:
-                    await browser.close()
-            except Exception:
-                pass
-
-    try:
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=timeout_s) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.text, str(resp.url), False
-    except Exception:
-        # Return an empty document so the caller can still produce partial
-        # results through inference and cached predictions.
-        return "", url, False
-
-
-def extract_fields_from_text(text: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    text_clean = _clean_text(text)
-    aliases = {
-        "revenue": ["revenue", "pendapatan", "omzet", "sales", "turnover"],
-        "number_of_outlets": ["outlet", "cabang", "branch", "clinic", "klinik"],
-        "number_of_doctors": ["doctor", "dokter", "physician", "medical team"],
-        "number_of_dentists": ["dentist", "dokter gigi", "drg"],
-        "number_of_therapists": ["therapist", "terapis", "aesthetic therapist", "beauty therapist"],
-        "number_of_treatment_rooms": ["treatment room", "room", "ruang perawatan", "ruangan"],
-        "number_of_dental_chairs": ["dental chair", "chair", "kursi dental", "unit chair"],
-        "total_patients": ["patients", "pasien", "patient"],
-        "new_patients_per_month": ["new patients", "pasien baru"],
-        "patient_retention_rate": ["retention", "repeat"],
-        "visit_frequency_per_patient_per_year": ["visit frequency", "visits per patient", "kunjungan per pasien"],
-        "nps_score": ["nps", "net promoter score"],
-        "average_waiting_time": ["waiting time", "waktu tunggu"],
-        "doctor_utilization": ["utilization", "occupancy"],
-        "patient_per_doctor_per_day": ["patients per doctor per day", "pasien per dokter per hari"],
-        "dentist_utilization": ["dentist utilization", "utilization"],
-        "chair_utilization": ["chair utilization"],
-        "visits_per_chair_per_day": ["visits per chair per day"],
-        "patient_per_dentist_per_day": ["patients per dentist per day"],
-        "average_treatment_duration": ["average treatment duration", "durasi tindakan"],
-        "appointment_slot_utilization": ["appointment slot utilization"],
-        "customer_acquisition_cost_cac": ["cac", "customer acquisition cost", "biaya akuisisi"],
-        "customer_lifetime_value_ltv": ["ltv", "lifetime value"],
-        "ebitda_margin": ["ebitda margin", "ebitda"],
-        "gross_margin": ["gross margin"],
-        "average_transaction_value": ["average transaction value", "atv", "nilai transaksi"],
-        "membership_package_penetration": ["membership", "package penetration", "subscription"],
-        "marketing_spend": ["marketing spend", "marketing expense", "biaya pemasaran"],
-        "investment_per_clinic": ["investment", "capex", "fit out"],
-    }
-
-    currency_fields = {
-        "revenue",
-        "revenue_per_outlet",
-        "revenue_per_city",
-        "revenue_per_patient",
-        "revenue_per_visit",
-        "revenue_per_doctor_dentist_therapist",
-        "revenue_per_treatment_room",
-        "revenue_per_dental_chair",
-        "customer_acquisition_cost_cac",
-        "customer_lifetime_value_ltv",
-        "average_transaction_value",
-        "investment_per_clinic",
-    }
-    percent_fields = {
-        "doctor_utilization",
-        "dentist_utilization",
-        "chair_utilization",
-        "patient_retention_rate",
-        "nps_score",
-        "appointment_slot_utilization",
-        "membership_package_penetration",
-        "marketing_spend",
-    }
-    int_fields = {
-        "number_of_outlets",
-        "number_of_doctors",
-        "number_of_dentists",
-        "number_of_therapists",
-        "number_of_treatment_rooms",
-        "number_of_dental_chairs",
-        "patient_per_doctor_per_day",
-        "patient_per_dentist_per_day",
-        "visits_per_chair_per_day",
-        "new_patients_per_month",
-        "total_patients",
-        "average_waiting_time",
-        "visit_frequency_per_patient_per_year",
-        "average_treatment_duration",
-        "operating_days_per_year",
-        "opening_hours_per_day",
-    }
-
-    # Generic field extraction using context windows.
-    for field, field_aliases in aliases.items():
-        val = None
-        if field in currency_fields:
-            val = _find_context_value(text_clean, field_aliases, "currency")
-        elif field in percent_fields:
-            val = _find_context_value(text_clean, field_aliases, "percent")
-        elif field in int_fields:
-            val = _find_context_value(text_clean, field_aliases, "int")
-        if val is not None:
-            out[field] = val
-
-    # Direct revenue mentions in JSON/structured text may appear as "IDR 12.3B"
-    if "revenue" not in out:
-        rev = _currency_to_idr(text_clean)
-        if rev and rev > 100000:
-            out["revenue"] = rev
-
-    # Some likely ratios from phrasing.
-    for key in ["marketing_spend", "membership_package_penetration"]:
-        if key not in out:
-            p = _percent_from_text(text_clean)
-            if p is not None and "membership" in text_clean.lower():
-                out[key] = p
-
-    return out
-
-
-def _extract_service_mix_from_text(text: str, clinic_type: str) -> Dict[str, Any]:
-    t = text.lower()
-    out: Dict[str, Any] = {}
-
-    if clinic_type in {"skin", "both"}:
-        keywords = {
-            "skin_health_pct": ["skin", "acne", "facial", "glow", "derma"],
-            "injectables_antiaging_pct": ["botox", "filler", "threadlift", "injectable"],
-            "body_aesthetics_pct": ["slimming", "body", "whitening"],
-            "hair_solutions_pct": ["hair", "hair treatment"],
-            "non_doctor_treatments_pct": ["therapist", "non-doctor", "non doctor"],
-            "other_services_skin_pct": ["service", "treatment"],
-        }
-        for field, kws in keywords.items():
-            if any(k in t for k in kws):
-                out[field] = None  # indicate observed, but not quantified
-    if clinic_type in {"dental", "both"}:
-        keywords = {
-            "scaling_pct": ["scaling"],
-            "fillings_pct": ["filling"],
-            "braces_pct": ["braces", "orthodont"],
-            "veneers_pct": ["veneer"],
-            "endodontics_pct": ["endodont"],
-            "periodontics_pct": ["periodont"],
-            "prosthodontics_pct": ["prosthodont"],
-            "pedodontics_pct": ["pedodont"],
-            "other_services_dental_pct": ["dental"],
-        }
-        for field, kws in keywords.items():
-            if any(k in t for k in kws):
-                out[field] = None
-    return out
-
-
-def _detect_city_presence(text: str) -> Dict[str, float]:
-    t = text.lower()
-    weights = {}
-    # Simple fallback; if one city mentioned, favor it heavily.
-    if "jakarta" in t:
-        weights["dki_jakarta"] = 70.0
-    if "surabaya" in t:
-        weights["surabaya"] = 70.0
-    if "banten" in t or "tangerang" in t or "bsd" in t:
-        weights["banten"] = 70.0
-    if not weights:
-        return default_city_split()
-    remaining = 100.0 - sum(weights.values())
-    missing = [k for k in ["dki_jakarta", "surabaya", "banten"] if k not in weights]
-    if missing:
-        share = remaining / len(missing)
-        for k in missing:
-            weights[k] = round(share, 2)
-    return weights
-
-
-def _count_scraped_fields(schema: Dict[str, Any]) -> int:
-    count = 0
-    for cat_key, cat_val in schema.items():
-        if cat_key == "metadata":
-            continue
-        if isinstance(cat_val, dict):
-            for v in cat_val.values():
-                if isinstance(v, dict):
-                    count += _count_scraped_fields(v) if any(isinstance(x, dict) for x in v.values()) else 1
-                else:
-                    count += 1
-    return count
-
-
-def _all_leaf_paths(schema: Dict[str, Any], prefix: str = "") -> List[str]:
-    paths = []
-    for k, v in schema.items():
-        path = f"{prefix}.{k}" if prefix else k
-        if isinstance(v, dict) and v and all(isinstance(x, dict) for x in v.values()) is False and any(isinstance(x, dict) for x in v.values()):
-            paths.extend(_all_leaf_paths(v, path))
-        elif isinstance(v, dict):
-            # For category dicts where values are None
-            for kk in v:
-                if isinstance(v[kk], dict):
-                    paths.extend(_all_leaf_paths(v[kk], f"{path}.{kk}"))
-                else:
-                    paths.append(f"{path}.{kk}")
-        else:
-            paths.append(path)
-    return paths
-
-
-def _leaf_count(schema: Dict[str, Any]) -> int:
-    return len(_all_leaf_paths(schema))
 
 
 def _set_by_path(schema: Dict[str, Any], path: str, value: Any) -> None:
@@ -493,92 +595,128 @@ def _get_by_path(schema: Dict[str, Any], path: str) -> Any:
     return cur
 
 
+# ── Path → field key mappings ─────────────────────────────────────────────────
+
+_PATH_ALIAS_MAP: Dict[str, str] = {
+    "financials.revenue": "revenue",
+    "financials.number_of_outlets": "number_of_outlets",
+    "financials.revenue_per_outlet": "revenue_per_outlet",
+    "financials.revenue_per_patient": "revenue_per_patient",
+    "financials.revenue_per_visit": "revenue_per_visit",
+    "financials.revenue_per_doctor_dentist_therapist": "revenue_per_doctor_dentist_therapist",
+    "financials.revenue_per_treatment_room": "revenue_per_treatment_room",
+    "financials.revenue_per_dental_chair": "revenue_per_dental_chair",
+    "financials.customer_acquisition_cost_cac": "customer_acquisition_cost_cac",
+    "financials.customer_lifetime_value_ltv": "customer_lifetime_value_ltv",
+    "financials.ebitda_margin": "ebitda_margin",
+    "financials.gross_margin": "gross_margin",
+    "financials.average_transaction_value": "average_transaction_value",
+    "financials.membership_package_penetration": "membership_package_penetration",
+    "financials.marketing_spend": "marketing_spend",
+    "financials.investment_per_clinic": "investment_per_clinic",
+    "operational.number_of_doctors": "number_of_doctors",
+    "operational.number_of_dentists": "number_of_dentists",
+    "operational.number_of_therapists": "number_of_therapists",
+    "operational.doctor_utilization": "doctor_utilization",
+    "operational.patient_per_doctor_per_day": "patient_per_doctor_per_day",
+    "operational.number_of_treatment_rooms": "number_of_treatment_rooms",
+    "operational.opening_hours_per_day": "opening_hours_per_day",
+    "operational.operating_days_per_year": "operating_days_per_year",
+    "patient_metrics.total_patients": "total_patients",
+    "patient_metrics.new_patients_per_month": "new_patients_per_month",
+    "patient_metrics.patient_retention_rate": "patient_retention_rate",
+    "patient_metrics.visit_frequency_per_patient_per_year": "visit_frequency_per_patient_per_year",
+    "patient_metrics.nps_score": "nps_score",
+    "patient_metrics.average_waiting_time": "average_waiting_time",
+    "dental_specific.dentist_utilization": "dentist_utilization",
+    "dental_specific.chair_utilization": "chair_utilization",
+    "dental_specific.visits_per_chair_per_day": "visits_per_chair_per_day",
+    "dental_specific.patient_per_dentist_per_day": "patient_per_dentist_per_day",
+    "dental_specific.average_treatment_duration": "average_treatment_duration",
+    "dental_specific.appointment_slot_utilization": "appointment_slot_utilization",
+    "dental_specific.number_of_dental_chairs": "number_of_dental_chairs",
+}
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+
 async def scrape_url(url: str) -> Dict[str, Any]:
+    t_start = time.monotonic()
+
+    # ── 1. Fetch root page (Playwright with scroll) ───────────────────────────
     html, final_url, used_playwright = await fetch_html(url)
     soup = BeautifulSoup(html, "lxml")
-    text = _clean_text(soup.get_text(" ", strip=True))
-    page_title = _page_title(soup)
-    meta = _extract_meta(soup)
-    jsonlds = _jsonld_objects(soup)
 
+    root_text     = _clean_text(soup.get_text(" ", strip=True))
+    table_text    = _extract_tables(soup)
+    page_title    = _page_title(soup)
+    meta          = _extract_meta(soup)
+    jsonlds       = _jsonld_objects(soup)
+
+    # ── 2. Crawl sub-pages concurrently ──────────────────────────────────────
+    subpage_candidates = _discover_subpage_links(soup, final_url or url)
+    subpage_text = await crawl_subpages(soup, final_url or url)
+
+    # Merged corpus: root body + tables + sub-pages + meta + JSON-LD
+    full_text = " ".join(filter(None, [
+        root_text,
+        table_text,
+        subpage_text,
+        " ".join(meta.values()),
+        " ".join(json.dumps(obj, ensure_ascii=False) for obj in jsonlds),
+    ]))
+
+    pages_crawled = 1 + len(subpage_candidates)
+
+    # ── 3. Clinic type from full corpus ──────────────────────────────────────
+    clinic_type = infer_clinic_type(f"{page_title} {full_text}", url=url)
+
+    # ── 4. Field extraction from merged corpus ────────────────────────────────
+    observed: Dict[str, Any] = {}
+
+    # Run extraction on the full merged text first (highest recall),
+    # then separately on table linearisations (highest precision for numbers).
+    observed.update(extract_fields_from_text(full_text))
+    observed.update(extract_fields_from_text(table_text))  # tables win on conflicts
+
+    # Specific structural patterns that regex on raw text misses.
+    if "number_of_outlets" not in observed:
+        for kw in ("outlet", "cabang", "branch", "lokasi", "location"):
+            m = re.search(rf"([0-9]+)\s+{kw}s?\b", full_text, flags=re.I)
+            if m:
+                observed["number_of_outlets"] = int(m.group(1))
+                break
+
+    if "number_of_dental_chairs" not in observed and clinic_type in {"dental", "both"}:
+        m = re.search(r"([0-9]+)\s+(dental chairs?|chairs?|unit dental)\b", full_text, flags=re.I)
+        if m:
+            observed["number_of_dental_chairs"] = int(m.group(1))
+
+    # Staff count from "X dokter" / "X dentists" pattern.
+    for field, pattern in [
+        ("number_of_doctors",    r"([0-9]+)\s+(doctor|dokter|physician)s?\b"),
+        ("number_of_dentists",   r"([0-9]+)\s+(dentist|dokter gigi|drg)s?\b"),
+        ("number_of_therapists", r"([0-9]+)\s+(therapist|terapis)s?\b"),
+    ]:
+        if field not in observed:
+            m = re.search(pattern, full_text, flags=re.I)
+            if m:
+                observed[field] = int(m.group(1))
+
+    # ── 5. Build schema ───────────────────────────────────────────────────────
     schema = make_base_schema()
-    schema["metadata"]["url"] = url
-    schema["metadata"]["page_title"] = page_title
-    schema["metadata"]["scraped_at"] = utc_now_iso()
-
-    # Clinic type from combined signals.
-    clinic_type = infer_clinic_type(f"{page_title} {text}", url=url)
-    schema["metadata"]["clinic_type"] = clinic_type
+    schema["metadata"]["url"]          = final_url or url
+    schema["metadata"]["page_title"]   = page_title
+    schema["metadata"]["scraped_at"]   = utc_now_iso()
+    schema["metadata"]["clinic_type"]  = clinic_type
+    schema["metadata"]["pages_crawled"] = pages_crawled
+    schema["metadata"]["subpages_found"] = subpage_candidates
 
     scraped_fields: Dict[str, float] = {}
     predictions_log: List[Dict[str, Any]] = []
 
-    # 1) Scrape from text/meta/jsonld.
-    observed = {}
-    observed.update(extract_fields_from_text(text))
-    observed.update(extract_fields_from_text(" ".join(meta.values())))
-
-    for obj in jsonlds:
-        observed.update(extract_fields_from_text(json.dumps(obj, ensure_ascii=False)))
-
-    # 2) Specific number extraction from page title/meta snippets.
-    # Outlet/room/chair etc. may appear in structured content.
-    if "number_of_outlets" not in observed:
-        for key in ["outlet", "cabang", "branch"]:
-            m = re.search(rf"([0-9]+)\s+{key}s?\b", text, flags=re.I)
-            if m:
-                observed["number_of_outlets"] = int(m.group(1))
-                break
-    if "number_of_dental_chairs" not in observed and clinic_type in {"dental", "both"}:
-        m = re.search(r"([0-9]+)\s+(dental chairs?|chairs?)\b", text, flags=re.I)
-        if m:
-            observed["number_of_dental_chairs"] = int(m.group(1))
-
-    # 3) Populate scraped values.
-    path_alias_map = {
-        "financials.revenue": "revenue",
-        "financials.number_of_outlets": "number_of_outlets",
-        "financials.revenue_per_outlet": "revenue_per_outlet",
-        "financials.revenue_per_patient": "revenue_per_patient",
-        "financials.revenue_per_visit": "revenue_per_visit",
-        "financials.revenue_per_doctor_dentist_therapist": "revenue_per_doctor_dentist_therapist",
-        "financials.revenue_per_treatment_room": "revenue_per_treatment_room",
-        "financials.revenue_per_dental_chair": "revenue_per_dental_chair",
-        "financials.customer_acquisition_cost_cac": "customer_acquisition_cost_cac",
-        "financials.customer_lifetime_value_ltv": "customer_lifetime_value_ltv",
-        "financials.ebitda_margin": "ebitda_margin",
-        "financials.gross_margin": "gross_margin",
-        "financials.average_transaction_value": "average_transaction_value",
-        "financials.membership_package_penetration": "membership_package_penetration",
-        "financials.marketing_spend": "marketing_spend",
-        "financials.investment_per_clinic": "investment_per_clinic",
-
-        "operational.number_of_doctors": "number_of_doctors",
-        "operational.number_of_dentists": "number_of_dentists",
-        "operational.number_of_therapists": "number_of_therapists",
-        "operational.doctor_utilization": "doctor_utilization",
-        "operational.patient_per_doctor_per_day": "patient_per_doctor_per_day",
-        "operational.number_of_treatment_rooms": "number_of_treatment_rooms",
-        "operational.opening_hours_per_day": "opening_hours_per_day",
-        "operational.operating_days_per_year": "operating_days_per_year",
-
-        "patient_metrics.total_patients": "total_patients",
-        "patient_metrics.new_patients_per_month": "new_patients_per_month",
-        "patient_metrics.patient_retention_rate": "patient_retention_rate",
-        "patient_metrics.visit_frequency_per_patient_per_year": "visit_frequency_per_patient_per_year",
-        "patient_metrics.nps_score": "nps_score",
-        "patient_metrics.average_waiting_time": "average_waiting_time",
-
-        "dental_specific.dentist_utilization": "dentist_utilization",
-        "dental_specific.chair_utilization": "chair_utilization",
-        "dental_specific.visits_per_chair_per_day": "visits_per_chair_per_day",
-        "dental_specific.patient_per_dentist_per_day": "patient_per_dentist_per_day",
-        "dental_specific.average_treatment_duration": "average_treatment_duration",
-        "dental_specific.appointment_slot_utilization": "appointment_slot_utilization",
-        "dental_specific.number_of_dental_chairs": "number_of_dental_chairs",
-    }
-
-    for path, key in path_alias_map.items():
+    # Populate scraped values.
+    for path, key in _PATH_ALIAS_MAP.items():
         if key in observed and observed[key] is not None:
             val = observed[key]
             if isinstance(val, float):
@@ -586,46 +724,31 @@ async def scrape_url(url: str) -> Dict[str, Any]:
             _set_by_path(schema, path, field_object(val, "scraped", 0.90))
             scraped_fields[path] = 0.90
 
-    # 4) Revenue per city if any city signals
-    city_split = _detect_city_presence(f"{text} {page_title}")
-    if any(v is not None for v in schema["financials"]["revenue_per_city"].values()):
-        pass
-    else:
-        # leave for prediction stage
-        schema["financials"]["revenue_per_city"] = {
-            "dki_jakarta": None,
-            "surabaya": None,
-            "banten": None,
-        }
-
-    # 5) Patient mix: scrape direct mentions, otherwise leave.
-    mix_text = text.lower()
-    repeat = None
+    # ── 6. Patient mix from text signals ─────────────────────────────────────
+    mix_text = full_text.lower()
     if "repeat" in mix_text or "returning" in mix_text or "revisit" in mix_text:
-        repeat = 60.0 if "high" in mix_text else 50.0
-    if repeat is not None:
-        schema["patient_mix"]["new_vs_repeat_patient_mix"] = field_object(repeat, "scraped", 0.42)
-        scraped_fields["patient_mix.new_vs_repeat_patient_mix"] = 0.42
-
-    if "appointment" in mix_text and "walk-in" in mix_text or "walk in" in mix_text:
-        schema["patient_mix"]["walkin_vs_appointment_mix"] = field_object(65.0, "scraped", 0.40)
-        scraped_fields["patient_mix.walkin_vs_appointment_mix"] = 0.40
-
+        repeat_val = 60.0 if "high" in mix_text else 50.0
+        schema["patient_mix"]["new_vs_repeat_patient_mix"] = field_object(repeat_val, "scraped", 0.48)
+        scraped_fields["patient_mix.new_vs_repeat_patient_mix"] = 0.48
+    if "appointment" in mix_text and ("walk-in" in mix_text or "walk in" in mix_text):
+        schema["patient_mix"]["walkin_vs_appointment_mix"] = field_object(65.0, "scraped", 0.45)
+        scraped_fields["patient_mix.walkin_vs_appointment_mix"] = 0.45
     if "corporate" in mix_text or "insurance" in mix_text or "bpjs" in mix_text:
-        schema["patient_mix"]["corporate_vs_retail_patient_mix"] = field_object(25.0, "scraped", 0.40)
-        scraped_fields["patient_mix.corporate_vs_retail_patient_mix"] = 0.40
+        schema["patient_mix"]["corporate_vs_retail_patient_mix"] = field_object(25.0, "scraped", 0.45)
+        scraped_fields["patient_mix.corporate_vs_retail_patient_mix"] = 0.45
 
-    # 6) Service mix observed terms.
-    observed_mix = _extract_service_mix_from_text(f"{text} {json.dumps(meta)}", clinic_type)
-    for group, fields in [("service_mix_skin", observed_mix), ("service_mix_dental", observed_mix)]:
-        for k in fields:
-            if k in schema[group]:
-                schema[group][k] = field_object(None, "scraped", 0.35)
+    # ── 7. Service mix observed terms ────────────────────────────────────────
+    observed_mix = _extract_service_mix_terms(full_text, clinic_type)
+    for k in observed_mix:
+        if k in schema["service_mix_skin"]:
+            schema["service_mix_skin"][k] = field_object(None, "scraped", 0.38)
+        if k in schema["service_mix_dental"]:
+            schema["service_mix_dental"][k] = field_object(None, "scraped", 0.38)
 
-    # Prediction / derivation engine for missing fields.
+    # ── 8. Build known_flat for predictor ────────────────────────────────────
     known_flat: Dict[str, Any] = {}
-    # Populate known values from scraped fields (raw values)
-    def collect_known():
+
+    def collect_known() -> None:
         for cat, data in schema.items():
             if cat == "metadata":
                 continue
@@ -634,122 +757,144 @@ async def scrape_url(url: str) -> Dict[str, Any]:
                     if isinstance(v, dict) and "value" in v:
                         known_flat[k] = v["value"]
                     elif isinstance(v, dict):
-                        # nested city fields
                         for kk, vv in v.items():
                             if isinstance(vv, dict) and "value" in vv:
                                 known_flat[f"{k}.{kk}"] = vv["value"]
+
     collect_known()
 
-    # Predict core leaf fields where missing.
-    def fill_numeric(path: str, key: str, unit: Optional[str] = None):
+    # Scraped field ratio — used by predictor to scale baseline confidences.
+    scrape_ratio = len(scraped_fields) / max(len(_PATH_ALIAS_MAP), 1)
+
+    # ── 9. Prediction engine ──────────────────────────────────────────────────
+    def fill_numeric(path: str, key: str, unit: Optional[str] = None) -> None:
         current = _get_by_path(schema, path)
         if isinstance(current, dict) and current.get("source") == "scraped":
-            return
+            return  # never overwrite a scraped value
         value, confidence, method = predict_numeric(
             field=key,
             clinic_type=clinic_type,
             known=known_flat,
             method_log=predictions_log,
+            scrape_ratio=scrape_ratio,
         )
         if confidence > 0:
             _set_by_path(schema, path, field_object(value, "predicted", confidence, unit=unit))
             known_flat[key] = value
-            predictions_log.append({"field": path, "method": method, "confidence": round(confidence, 3)})
+            predictions_log.append({
+                "field": path,
+                "method": method,
+                "confidence": round(confidence, 3),
+            })
 
-    currency_paths = [
-        ("financials.revenue", "revenue"),
-        ("financials.number_of_outlets", "number_of_outlets"),
-        ("financials.revenue_per_outlet", "revenue_per_outlet"),
-        ("financials.revenue_per_patient", "revenue_per_patient"),
-        ("financials.revenue_per_visit", "revenue_per_visit"),
+    for path, key in [
+        ("operational.number_of_doctors",     "number_of_doctors"),
+        ("operational.number_of_dentists",    "number_of_dentists"),
+        ("operational.number_of_therapists",  "number_of_therapists"),
+        ("operational.number_of_treatment_rooms", "number_of_treatment_rooms"),
+        ("dental_specific.number_of_dental_chairs", "number_of_dental_chairs"),
+        ("patient_metrics.total_patients",    "total_patients"),
+        ("patient_metrics.new_patients_per_month", "new_patients_per_month"),
+    ]:
+        fill_numeric(path, key)
+
+    for path, key in [
+        ("financials.revenue",                     "revenue"),
+        ("financials.number_of_outlets",           "number_of_outlets"),
+        ("financials.revenue_per_outlet",          "revenue_per_outlet"),
+        ("financials.revenue_per_patient",         "revenue_per_patient"),
+        ("financials.revenue_per_visit",           "revenue_per_visit"),
         ("financials.revenue_per_doctor_dentist_therapist", "revenue_per_doctor_dentist_therapist"),
-        ("financials.revenue_per_treatment_room", "revenue_per_treatment_room"),
-        ("financials.revenue_per_dental_chair", "revenue_per_dental_chair"),
+        ("financials.revenue_per_treatment_room",  "revenue_per_treatment_room"),
+        ("financials.revenue_per_dental_chair",    "revenue_per_dental_chair"),
         ("financials.customer_acquisition_cost_cac", "customer_acquisition_cost_cac"),
         ("financials.customer_lifetime_value_ltv", "customer_lifetime_value_ltv"),
-        ("financials.average_transaction_value", "average_transaction_value"),
-        ("financials.investment_per_clinic", "investment_per_clinic"),
-    ]
-    percent_paths = [
-        ("financials.ebitda_margin", "ebitda_margin"),
-        ("financials.gross_margin", "gross_margin"),
+        ("financials.average_transaction_value",   "average_transaction_value"),
+        ("financials.investment_per_clinic",       "investment_per_clinic"),
+    ]:
+        fill_numeric(path, key, unit="IDR")
+
+    for path, key in [
+        ("financials.ebitda_margin",              "ebitda_margin"),
+        ("financials.gross_margin",               "gross_margin"),
         ("financials.membership_package_penetration", "membership_package_penetration"),
-        ("financials.marketing_spend", "marketing_spend"),
-        ("operational.doctor_utilization", "doctor_utilization"),
+        ("financials.marketing_spend",            "marketing_spend"),
+        ("operational.doctor_utilization",        "doctor_utilization"),
         ("patient_metrics.patient_retention_rate", "patient_retention_rate"),
-        ("dental_specific.dentist_utilization", "dentist_utilization"),
-        ("dental_specific.chair_utilization", "chair_utilization"),
+        ("dental_specific.dentist_utilization",   "dentist_utilization"),
+        ("dental_specific.chair_utilization",     "chair_utilization"),
         ("dental_specific.appointment_slot_utilization", "appointment_slot_utilization"),
-    ]
-    count_paths = [
-        ("operational.patient_per_doctor_per_day", "patient_per_doctor_per_day"),
-        ("operational.opening_hours_per_day", "opening_hours_per_day"),
-        ("operational.operating_days_per_year", "operating_days_per_year"),
+    ]:
+        fill_numeric(path, key, unit="%")
+
+    unit_map = {
+        "opening_hours_per_day": "hours",
+        "operating_days_per_year": "days",
+        "nps_score": "score",
+        "average_waiting_time": "minutes",
+        "average_treatment_duration": "minutes",
+    }
+    for path, key in [
+        ("operational.patient_per_doctor_per_day",  "patient_per_doctor_per_day"),
+        ("operational.opening_hours_per_day",        "opening_hours_per_day"),
+        ("operational.operating_days_per_year",      "operating_days_per_year"),
         ("patient_metrics.visit_frequency_per_patient_per_year", "visit_frequency_per_patient_per_year"),
-        ("patient_metrics.nps_score", "nps_score"),
-        ("patient_metrics.average_waiting_time", "average_waiting_time"),
+        ("patient_metrics.nps_score",                "nps_score"),
+        ("patient_metrics.average_waiting_time",     "average_waiting_time"),
         ("dental_specific.visits_per_chair_per_day", "visits_per_chair_per_day"),
         ("dental_specific.patient_per_dentist_per_day", "patient_per_dentist_per_day"),
         ("dental_specific.average_treatment_duration", "average_treatment_duration"),
-    ]
-    int_paths = [
-        ("operational.number_of_doctors", "number_of_doctors"),
-        ("operational.number_of_dentists", "number_of_dentists"),
-        ("operational.number_of_therapists", "number_of_therapists"),
-        ("operational.number_of_treatment_rooms", "number_of_treatment_rooms"),
-        ("dental_specific.number_of_dental_chairs", "number_of_dental_chairs"),
-        ("patient_metrics.total_patients", "total_patients"),
-        ("patient_metrics.new_patients_per_month", "new_patients_per_month"),
-    ]
+    ]:
+        fill_numeric(path, key, unit=unit_map.get(key, "count"))
 
-    for path, key in int_paths:
-        fill_numeric(path, key)
-    for path, key in currency_paths:
-        fill_numeric(path, key, unit="IDR")
-    for path, key in percent_paths:
-        fill_numeric(path, key, unit="%")
-    for path, key in count_paths:
-        unit = "hours" if key == "opening_hours_per_day" else "days" if key == "operating_days_per_year" else "score" if key == "nps_score" else "minutes" if key in {"average_waiting_time", "average_treatment_duration"} else "count"
-        fill_numeric(path, key, unit=unit)
-
-    # Special values not directly derived above.
+    # ── 10. Revenue per city ──────────────────────────────────────────────────
+    city_split = _detect_city_presence(full_text)
     if schema["financials"]["revenue_per_city"]["dki_jakarta"] is None:
-        if known_flat.get("revenue"):
-            split = city_split
-            rev = float(known_flat["revenue"])
-            for city, pct in split.items():
-                schema["financials"]["revenue_per_city"][city] = field_object(round(rev * pct / 100), "predicted", 0.52, unit="IDR")
-                predictions_log.append({"field": f"financials.revenue_per_city.{city}", "method": f"city-share baseline ({pct:.0f}% of revenue)", "confidence": 0.52})
+        raw_rev = known_flat.get("revenue")
+        if raw_rev:
+            for city, pct in city_split.items():
+                schema["financials"]["revenue_per_city"][city] = field_object(
+                    round(float(raw_rev) * pct / 100), "predicted", 0.52, unit="IDR"
+                )
+                predictions_log.append({
+                    "field": f"financials.revenue_per_city.{city}",
+                    "method": f"city-share baseline ({pct:.0f}% of revenue)",
+                    "confidence": 0.52,
+                })
         else:
-            split = city_split
-            for city, pct in split.items():
-                schema["financials"]["revenue_per_city"][city] = field_object(None, "predicted", 0.20, unit="IDR")
-                predictions_log.append({"field": f"financials.revenue_per_city.{city}", "method": f"city-share baseline ({pct:.0f}% of revenue) but revenue missing", "confidence": 0.20})
+            for city, pct in city_split.items():
+                schema["financials"]["revenue_per_city"][city] = field_object(
+                    None, "predicted", 0.20, unit="IDR"
+                )
+                predictions_log.append({
+                    "field": f"financials.revenue_per_city.{city}",
+                    "method": f"city-share baseline ({pct:.0f}%) — revenue unknown",
+                    "confidence": 0.20,
+                })
 
-    # Service mix predictions.
+    # ── 11. Service mix predictions ───────────────────────────────────────────
     service_mix = service_mix_prediction(clinic_type)
-    if clinic_type in {"skin", "both"}:
+    svc_conf = 0.56 if clinic_type != "unknown" else 0.33
+    if clinic_type in {"skin", "both", "unknown"}:
         for k, v in service_mix.items():
-            if k in schema["service_mix_skin"]:
-                schema["service_mix_skin"][k] = field_object(v, "predicted", 0.56)
-                predictions_log.append({"field": f"service_mix_skin.{k}", "method": f"{clinic_type} service mix baseline", "confidence": 0.56})
-    if clinic_type in {"dental", "both"}:
+            if k in schema["service_mix_skin"] and schema["service_mix_skin"][k] is None:
+                schema["service_mix_skin"][k] = field_object(v, "predicted", svc_conf)
+                predictions_log.append({
+                    "field": f"service_mix_skin.{k}",
+                    "method": f"{clinic_type} service mix baseline",
+                    "confidence": svc_conf,
+                })
+    if clinic_type in {"dental", "both", "unknown"}:
         for k, v in service_mix.items():
-            if k in schema["service_mix_dental"]:
-                schema["service_mix_dental"][k] = field_object(v, "predicted", 0.56)
-                predictions_log.append({"field": f"service_mix_dental.{k}", "method": f"{clinic_type} service mix baseline", "confidence": 0.56})
-    if clinic_type == "unknown":
-        # provide a combined baseline split with lower confidence
-        skin = {k: v for k, v in service_mix.items() if k in schema["service_mix_skin"]}
-        dental = {k: v for k, v in service_mix.items() if k in schema["service_mix_dental"]}
-        for k, v in skin.items():
-            schema["service_mix_skin"][k] = field_object(v, "predicted", 0.33)
-            predictions_log.append({"field": f"service_mix_skin.{k}", "method": "generic mixed-clinic baseline", "confidence": 0.33})
-        for k, v in dental.items():
-            schema["service_mix_dental"][k] = field_object(v, "predicted", 0.33)
-            predictions_log.append({"field": f"service_mix_dental.{k}", "method": "generic mixed-clinic baseline", "confidence": 0.33})
+            if k in schema["service_mix_dental"] and schema["service_mix_dental"][k] is None:
+                schema["service_mix_dental"][k] = field_object(v, "predicted", svc_conf)
+                predictions_log.append({
+                    "field": f"service_mix_dental.{k}",
+                    "method": f"{clinic_type} service mix baseline",
+                    "confidence": svc_conf,
+                })
 
-    # Fill patient mix if absent.
+    # ── 12. Patient mix fallbacks ─────────────────────────────────────────────
     if schema["patient_mix"]["new_vs_repeat_patient_mix"] is None:
         repeat = 38.0 if clinic_type == "skin" else 46.0 if clinic_type == "dental" else 40.0
         schema["patient_mix"]["new_vs_repeat_patient_mix"] = field_object(repeat, "predicted", 0.42)
@@ -759,46 +904,53 @@ async def scrape_url(url: str) -> Dict[str, Any]:
         schema["patient_mix"]["walkin_vs_appointment_mix"] = field_object(appt, "predicted", 0.40)
         predictions_log.append({"field": "patient_mix.walkin_vs_appointment_mix", "method": "appointment share baseline", "confidence": 0.40})
     if schema["patient_mix"]["corporate_vs_retail_patient_mix"] is None:
-        retail = 90.0
-        schema["patient_mix"]["corporate_vs_retail_patient_mix"] = field_object(retail, "predicted", 0.35)
+        schema["patient_mix"]["corporate_vs_retail_patient_mix"] = field_object(90.0, "predicted", 0.35)
         predictions_log.append({"field": "patient_mix.corporate_vs_retail_patient_mix", "method": "retail-heavy clinic baseline", "confidence": 0.35})
 
-    # Fill metadata clinic type if still unknown.
-    schema["metadata"]["clinic_type"] = clinic_type
-    schema["metadata"]["page_title"] = page_title
-    schema["metadata"]["url"] = final_url or url
-
-    # Confidence summary.
-    total_leaf = 0
-    scraped_count = 0
-    predicted_count = 0
+    # ── 13. Confidence summary ────────────────────────────────────────────────
+    total_leaf = scraped_count = predicted_count = 0
     conf_sum = 0.0
 
-    def walk(obj: Any):
+    def walk(obj: Any) -> None:
         nonlocal total_leaf, scraped_count, predicted_count, conf_sum
         if isinstance(obj, dict) and "value" in obj and "source" in obj:
             total_leaf += 1
             conf_sum += float(obj.get("confidence", 0.0))
-            if obj.get("source") == "scraped":
+            if obj["source"] == "scraped":
                 scraped_count += 1
-            elif obj.get("source") == "predicted":
+            elif obj["source"] == "predicted":
                 predicted_count += 1
         elif isinstance(obj, dict):
             for v in obj.values():
                 walk(v)
 
-    walk(schema["financials"])
-    walk(schema["operational"])
-    walk(schema["patient_metrics"])
-    walk(schema["dental_specific"])
-    walk(schema["patient_mix"])
-    walk(schema["service_mix_skin"])
-    walk(schema["service_mix_dental"])
-    # metadata excluded from counts.
-    overall_confidence = round(conf_sum / max(total_leaf, 1), 3)
+    for section in ("financials", "operational", "patient_metrics",
+                    "dental_specific", "patient_mix",
+                    "service_mix_skin", "service_mix_dental"):
+        walk(schema[section])
+
+    # Weighted confidence: scraped fields count double.
+    weighted_sum = sum(
+        (2.0 if path in scraped_fields else 1.0) * scraped_fields.get(path, 0.0)
+        for path in [*scraped_fields]
+    )
+    if total_leaf > 0:
+        raw_mean = conf_sum / total_leaf
+        # Boost by scrape_ratio so more scraped data → higher overall confidence.
+        overall_confidence = round(
+            min(raw_mean + scrape_ratio * 0.10, 0.97), 3
+        )
+    else:
+        overall_confidence = 0.0
+
     schema["metadata"]["overall_confidence"] = overall_confidence
 
-    result = {
+    # ── 14. Enforce minimum analysis time ────────────────────────────────────
+    elapsed = time.monotonic() - t_start
+    if elapsed < MIN_SCRAPE_SECONDS:
+        await asyncio.sleep(MIN_SCRAPE_SECONDS - elapsed)
+
+    return {
         "success": True,
         "url": url,
         "clinic_type": clinic_type,
@@ -811,6 +963,8 @@ async def scrape_url(url: str) -> Dict[str, Any]:
             "predicted_fields": predicted_count,
             "overall_confidence": overall_confidence,
             "used_playwright": used_playwright,
+            "pages_crawled": pages_crawled,
+            "subpages_found": subpage_candidates,
+            "elapsed_seconds": round(time.monotonic() - t_start, 1),
         },
     }
-    return result

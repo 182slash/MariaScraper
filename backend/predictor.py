@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+
+# ── Service mix baselines ─────────────────────────────────────────────────────
 
 SKIN_SERVICE_MIX = {
     "skin_health_pct": 28,
@@ -26,13 +26,42 @@ DENTAL_SERVICE_MIX = {
     "other_services_dental_pct": 10,
 }
 
+# Penalty applied to confidence when a derived field relies on another
+# predicted (not scraped) value.  Each additional prediction hop costs this.
+_PREDICTION_HOP_PENALTY = 0.12
 
-def _sum_pct(values: Dict[str, float]) -> float:
-    return float(sum(values.values()))
+# Fields whose values are produced by prediction rather than scraping.
+# Maintained at module level; reset by the scraper at the start of each run
+# via `mark_predicted`.
+_predicted_keys: set[str] = set()
 
 
-def scale_mix(mix: Dict[str, float], target: float = 100.0) -> Dict[str, float]:
-    total = _sum_pct(mix)
+def reset_prediction_registry() -> None:
+    """Call at the start of each scrape_url invocation."""
+    _predicted_keys.clear()
+
+
+def mark_predicted(key: str) -> None:
+    """Register a key as predicted (not scraped) so dependents are penalised."""
+    _predicted_keys.add(key)
+
+
+def _is_predicted(key: str) -> bool:
+    return key in _predicted_keys
+
+
+def _hop_penalty(*dep_keys: str) -> float:
+    """
+    Return the cumulative hop penalty for the given dependency keys.
+    Each predicted dependency adds one penalty unit.
+    """
+    return _PREDICTION_HOP_PENALTY * sum(1 for k in dep_keys if _is_predicted(k))
+
+
+# ── Utility ───────────────────────────────────────────────────────────────────
+
+def _scale_mix(mix: Dict[str, float], target: float = 100.0) -> Dict[str, float]:
+    total = float(sum(mix.values()))
     if total == 0:
         return mix
     factor = target / total
@@ -42,14 +71,16 @@ def scale_mix(mix: Dict[str, float], target: float = 100.0) -> Dict[str, float]:
 def infer_clinic_type(text: str, url: str = "") -> str:
     t = f"{text} {url}".lower()
     skin_hits = [
-        "skincare", "skin", "aesthetic", "estetik", "beauty", "derma", "dermatology",
-        "acne", "facial", "botox", "filler", "threadlift", "glow", "laser", "hair removal"
+        "skincare", "skin", "aesthetic", "estetik", "beauty", "derma",
+        "dermatology", "acne", "facial", "botox", "filler", "threadlift",
+        "glow", "laser", "hair removal",
     ]
     dental_hits = [
-        "dental", "dentist", "dentistry", "gigi", "orthodont", "braces", "veneer",
-        "implan", "implant", "scaling", "endodont", "periodont", "prosthodont", "pedodont"
+        "dental", "dentist", "dentistry", "gigi", "orthodont", "braces",
+        "veneer", "implan", "implant", "scaling", "endodont", "periodont",
+        "prosthodont", "pedodont",
     ]
-    skin = any(h in t for h in skin_hits)
+    skin   = any(h in t for h in skin_hits)
     dental = any(h in t for h in dental_hits)
     if skin and dental:
         return "both"
@@ -64,178 +95,248 @@ def default_city_split() -> Dict[str, float]:
     return {"dki_jakarta": 55.0, "surabaya": 25.0, "banten": 20.0}
 
 
+# ── Core predictor ────────────────────────────────────────────────────────────
+
 def predict_numeric(
     *,
     field: str,
     clinic_type: str,
     known: Dict[str, Any],
     method_log: List[Dict[str, Any]],
+    scrape_ratio: float = 0.0,
 ) -> Tuple[float | int, float, str]:
     """
-    Returns (value, confidence, method)
+    Returns (value, confidence, method).
+
+    ``scrape_ratio`` is len(scraped_fields) / total_fields from the scraper,
+    ranging 0–1.  Higher ratios → derived values earn higher confidence
+    because the inputs they rely on are more likely to be real.
+
+    Confidence is reduced by ``_hop_penalty`` for every dependency that was
+    itself predicted rather than scraped.  This prevents silent
+    prediction-of-prediction chains from appearing as confident as
+    derivations from real data.
     """
-    revenue = known.get("revenue")
-    outlets = known.get("number_of_outlets")
+    revenue  = known.get("revenue")
+    outlets  = known.get("number_of_outlets")
     patients = known.get("total_patients")
-    visits_per_year = known.get("visit_frequency_per_patient_per_year")
-    doctors = known.get("number_of_doctors")
+    visits_y = known.get("visit_frequency_per_patient_per_year")
+    doctors  = known.get("number_of_doctors")
     dentists = known.get("number_of_dentists")
     therapists = known.get("number_of_therapists")
-    rooms = known.get("number_of_treatment_rooms")
-    chairs = known.get("number_of_dental_chairs")
+    rooms    = known.get("number_of_treatment_rooms")
+    chairs   = known.get("number_of_dental_chairs")
+    atv      = known.get("average_transaction_value")
 
-    # Core financials
+    # Scrape-ratio bonus: the more real data we have, the more we trust
+    # derivations that use it.
+    _sr_bonus = scrape_ratio * 0.08   # max +0.08 when everything was scraped
+
+    # ── Derived financial fields ──────────────────────────────────────────────
     if field == "revenue_per_outlet" and revenue and outlets:
-        return round(revenue / max(outlets, 1)), 0.95, "revenue ÷ outlets"
-    if field == "revenue_per_patient" and revenue and patients:
-        return round(revenue / max(patients, 1)), 0.92, "revenue ÷ patients"
-    if field == "revenue_per_visit" and revenue and patients and visits_per_year:
-        visits = max(patients * visits_per_year, 1)
-        return round(revenue / visits), 0.84, "revenue ÷ estimated annual visits"
-    if field == "revenue_per_doctor_dentist_therapist":
-        staff = sum(x for x in [doctors, dentists, therapists] if isinstance(x, (int, float)) and x > 0)
-        if revenue and staff:
-            return round(revenue / staff), 0.88, "revenue ÷ clinical staff count"
-    if field == "revenue_per_treatment_room" and revenue and rooms:
-        return round(revenue / max(rooms, 1)), 0.90, "revenue ÷ treatment rooms"
-    if field == "revenue_per_dental_chair" and revenue and chairs:
-        return round(revenue / max(chairs, 1)), 0.90, "revenue ÷ dental chairs"
+        conf = 0.95 - _hop_penalty("revenue", "number_of_outlets") + _sr_bonus
+        return round(revenue / max(outlets, 1)), min(conf, 0.95), "revenue ÷ outlets"
 
-    # Margins / marketing / CAC / LTV
+    if field == "revenue_per_patient" and revenue and patients:
+        conf = 0.92 - _hop_penalty("revenue", "total_patients") + _sr_bonus
+        return round(revenue / max(patients, 1)), min(conf, 0.92), "revenue ÷ patients"
+
+    if field == "revenue_per_visit" and revenue and patients and visits_y:
+        visits = max(patients * visits_y, 1)
+        conf = 0.84 - _hop_penalty("revenue", "total_patients", "visit_frequency_per_patient_per_year") + _sr_bonus
+        return round(revenue / visits), min(conf, 0.84), "revenue ÷ estimated annual visits"
+
+    if field == "revenue_per_doctor_dentist_therapist":
+        staff = sum(
+            x for x in [doctors, dentists, therapists]
+            if isinstance(x, (int, float)) and x > 0
+        )
+        if revenue and staff:
+            conf = 0.88 - _hop_penalty("revenue", "number_of_doctors", "number_of_dentists", "number_of_therapists") + _sr_bonus
+            return round(revenue / staff), min(conf, 0.88), "revenue ÷ clinical staff"
+
+    if field == "revenue_per_treatment_room" and revenue and rooms:
+        conf = 0.90 - _hop_penalty("revenue", "number_of_treatment_rooms") + _sr_bonus
+        return round(revenue / max(rooms, 1)), min(conf, 0.90), "revenue ÷ treatment rooms"
+
+    if field == "revenue_per_dental_chair" and revenue and chairs:
+        conf = 0.90 - _hop_penalty("revenue", "number_of_dental_chairs") + _sr_bonus
+        return round(revenue / max(chairs, 1)), min(conf, 0.90), "revenue ÷ dental chairs"
+
+    # ── Margins ───────────────────────────────────────────────────────────────
     if field == "gross_margin":
-        if clinic_type == "skin":
-            return 58.0, 0.72, "skin clinic gross margin baseline"
-        if clinic_type == "dental":
-            return 52.0, 0.72, "dental clinic gross margin baseline"
-        if clinic_type == "both":
-            return 55.0, 0.68, "blended clinic gross margin baseline"
-        return 50.0, 0.55, "generic clinic gross margin baseline"
+        base, method = {
+            "skin":    (58.0, "skin clinic gross margin baseline"),
+            "dental":  (52.0, "dental clinic gross margin baseline"),
+            "both":    (55.0, "blended clinic gross margin baseline"),
+        }.get(clinic_type, (50.0, "generic clinic gross margin baseline"))
+        conf = {
+            "skin": 0.72, "dental": 0.72, "both": 0.68,
+        }.get(clinic_type, 0.55) + _sr_bonus
+        return base, min(conf, 0.80), method
+
     if field == "ebitda_margin":
-        if clinic_type == "skin":
-            return 20.0, 0.70, "skin clinic EBITDA baseline"
-        if clinic_type == "dental":
-            return 18.0, 0.70, "dental clinic EBITDA baseline"
-        if clinic_type == "both":
-            return 19.0, 0.66, "blended EBITDA baseline"
-        return 17.0, 0.52, "generic EBITDA baseline"
+        base, method = {
+            "skin":   (20.0, "skin clinic EBITDA baseline"),
+            "dental": (18.0, "dental clinic EBITDA baseline"),
+            "both":   (19.0, "blended EBITDA baseline"),
+        }.get(clinic_type, (17.0, "generic EBITDA baseline"))
+        conf = {
+            "skin": 0.70, "dental": 0.70, "both": 0.66,
+        }.get(clinic_type, 0.52) + _sr_bonus
+        return base, min(conf, 0.78), method
+
     if field == "marketing_spend":
-        if clinic_type == "skin":
-            return 12.0, 0.64, "skin clinic marketing ratio baseline"
-        if clinic_type == "dental":
-            return 9.0, 0.62, "dental clinic marketing ratio baseline"
-        return 10.0, 0.50, "generic marketing ratio baseline"
+        base, method = {
+            "skin":   (12.0, "skin clinic marketing ratio baseline"),
+            "dental": (9.0,  "dental clinic marketing ratio baseline"),
+        }.get(clinic_type, (10.0, "generic marketing ratio baseline"))
+        conf = {"skin": 0.64, "dental": 0.62}.get(clinic_type, 0.50) + _sr_bonus
+        return base, min(conf, 0.72), method
+
+    # ── CAC / LTV ─────────────────────────────────────────────────────────────
     if field == "customer_acquisition_cost_cac":
-        if clinic_type == "skin":
-            return 350000, 0.60, "skin clinic CAC baseline"
-        if clinic_type == "dental":
-            return 220000, 0.60, "dental clinic CAC baseline"
-        return 250000, 0.48, "generic CAC baseline"
+        base, method = {
+            "skin":   (350_000, "skin clinic CAC baseline"),
+            "dental": (220_000, "dental clinic CAC baseline"),
+        }.get(clinic_type, (250_000, "generic CAC baseline"))
+        conf = {"skin": 0.60, "dental": 0.60}.get(clinic_type, 0.48) + _sr_bonus
+        return base, min(conf, 0.68), method
+
     if field == "customer_lifetime_value_ltv":
         if revenue and patients:
-            visits = visits_per_year or 2.5
+            visits = visits_y or 2.5
             avg = revenue / max(patients * visits, 1)
-            return round(avg * visits * 3.5), 0.71, "average revenue per patient × retention horizon"
-        if clinic_type == "skin":
-            return 2400000, 0.58, "skin clinic LTV baseline"
-        if clinic_type == "dental":
-            return 1800000, 0.58, "dental clinic LTV baseline"
-        return 1500000, 0.46, "generic LTV baseline"
-    if field == "investment_per_clinic":
-        if clinic_type == "skin":
-            return 2800000000, 0.62, "skin clinic fit-out baseline"
-        if clinic_type == "dental":
-            return 2400000000, 0.62, "dental clinic equipment baseline"
-        return 2000000000, 0.45, "generic clinic investment baseline"
+            conf = 0.71 - _hop_penalty("revenue", "total_patients", "visit_frequency_per_patient_per_year") + _sr_bonus
+            return round(avg * visits * 3.5), min(conf, 0.71), "avg revenue per patient × retention horizon"
+        base, method = {
+            "skin":   (2_400_000, "skin clinic LTV baseline"),
+            "dental": (1_800_000, "dental clinic LTV baseline"),
+        }.get(clinic_type, (1_500_000, "generic LTV baseline"))
+        conf = {"skin": 0.58, "dental": 0.58}.get(clinic_type, 0.46) + _sr_bonus
+        return base, min(conf, 0.66), method
 
-    # Operational
+    if field == "investment_per_clinic":
+        base, method = {
+            "skin":   (2_800_000_000, "skin clinic fit-out baseline"),
+            "dental": (2_400_000_000, "dental clinic equipment baseline"),
+        }.get(clinic_type, (2_000_000_000, "generic clinic investment baseline"))
+        conf = {"skin": 0.62, "dental": 0.62}.get(clinic_type, 0.45) + _sr_bonus
+        return base, min(conf, 0.70), method
+
+    # ── Operational ───────────────────────────────────────────────────────────
     if field == "opening_hours_per_day":
-        return 10, 0.85, "common clinic operating hours assumption"
+        return 10, 0.85 + _sr_bonus, "common clinic operating hours assumption"
+
     if field == "operating_days_per_year":
-        return 360, 0.84, "near-year-round clinic operating assumption"
+        return 360, 0.84 + _sr_bonus, "near-year-round clinic operating assumption"
+
     if field == "doctor_utilization":
-        if clinic_type == "skin":
-            return 72.0, 0.59, "skin clinic utilization baseline"
-        if clinic_type == "dental":
-            return 68.0, 0.59, "dental clinic utilization baseline"
-        return 65.0, 0.48, "generic utilization baseline"
+        base, method = {
+            "skin":   (72.0, "skin clinic utilization baseline"),
+            "dental": (68.0, "dental clinic utilization baseline"),
+        }.get(clinic_type, (65.0, "generic utilization baseline"))
+        conf = {"skin": 0.59, "dental": 0.59}.get(clinic_type, 0.48) + _sr_bonus
+        return base, min(conf, 0.67), method
+
     if field == "patient_per_doctor_per_day":
-        if clinic_type == "skin":
-            return 18, 0.60, "skin clinic throughput baseline"
-        if clinic_type == "dental":
-            return 12, 0.60, "dental clinic throughput baseline"
-        return 15, 0.47, "generic throughput baseline"
+        base, method = {
+            "skin":   (18, "skin clinic throughput baseline"),
+            "dental": (12, "dental clinic throughput baseline"),
+        }.get(clinic_type, (15, "generic throughput baseline"))
+        conf = {"skin": 0.60, "dental": 0.60}.get(clinic_type, 0.47) + _sr_bonus
+        return base, min(conf, 0.68), method
+
     if field == "dentist_utilization":
-        return 70.0, 0.58, "dental utilization baseline"
+        return 70.0, 0.58 + _sr_bonus, "dental utilization baseline"
+
     if field == "chair_utilization":
-        return 68.0, 0.57, "dental chair utilization baseline"
+        return 68.0, 0.57 + _sr_bonus, "dental chair utilization baseline"
+
     if field == "visits_per_chair_per_day":
-        return 11, 0.57, "dental chair throughput baseline"
+        return 11, 0.57 + _sr_bonus, "dental chair throughput baseline"
+
     if field == "patient_per_dentist_per_day":
-        return 11, 0.57, "dental dentist throughput baseline"
+        return 11, 0.57 + _sr_bonus, "dental dentist throughput baseline"
+
     if field == "average_treatment_duration":
         if clinic_type == "dental":
-            return 45, 0.56, "dental treatment duration baseline"
-        return 35, 0.48, "generic treatment duration baseline"
-    if field == "appointment_slot_utilization":
-        return 82.0, 0.55, "appointment slot utilization baseline"
+            return 45, 0.56 + _sr_bonus, "dental treatment duration baseline"
+        return 35, 0.48 + _sr_bonus, "generic treatment duration baseline"
 
-    # Patient metrics
+    if field == "appointment_slot_utilization":
+        return 82.0, 0.55 + _sr_bonus, "appointment slot utilization baseline"
+
+    # ── Patient metrics ───────────────────────────────────────────────────────
     if field == "patient_retention_rate":
-        if clinic_type == "skin":
-            return 38.0, 0.56, "skin retention baseline"
-        if clinic_type == "dental":
-            return 46.0, 0.56, "dental retention baseline"
-        return 40.0, 0.45, "generic retention baseline"
+        base, method = {
+            "skin":   (38.0, "skin retention baseline"),
+            "dental": (46.0, "dental retention baseline"),
+        }.get(clinic_type, (40.0, "generic retention baseline"))
+        conf = {"skin": 0.56, "dental": 0.56}.get(clinic_type, 0.45) + _sr_bonus
+        return base, min(conf, 0.64), method
+
     if field == "visit_frequency_per_patient_per_year":
-        if clinic_type == "skin":
-            return 3.0, 0.56, "skin visit frequency baseline"
-        if clinic_type == "dental":
-            return 2.4, 0.56, "dental visit frequency baseline"
-        return 2.5, 0.45, "generic visit frequency baseline"
+        base, method = {
+            "skin":   (3.0, "skin visit frequency baseline"),
+            "dental": (2.4, "dental visit frequency baseline"),
+        }.get(clinic_type, (2.5, "generic visit frequency baseline"))
+        conf = {"skin": 0.56, "dental": 0.56}.get(clinic_type, 0.45) + _sr_bonus
+        return base, min(conf, 0.64), method
+
     if field == "nps_score":
-        return 65, 0.40, "industry-normal NPS baseline"
+        return 65, 0.40 + _sr_bonus, "industry-normal NPS baseline"
+
     if field == "average_waiting_time":
-        return 18, 0.54, "clinic queue baseline"
+        return 18, 0.54 + _sr_bonus, "clinic queue baseline"
+
     if field == "new_patients_per_month":
         if patients:
-            return max(int(round(patients * 0.06 / 12)), 1), 0.45, "6% annual growth proxy"
-        return 120, 0.40, "market growth baseline"
+            # patients itself may be predicted — apply penalty.
+            conf = 0.45 - _hop_penalty("total_patients") + _sr_bonus
+            return max(int(round(patients * 0.06 / 12)), 1), max(conf, 0.25), "6% annual growth proxy"
+        return 120, 0.40 + _sr_bonus, "market growth baseline"
+
     if field == "total_patients":
-        if revenue and clinic_type in {"skin", "dental", "both"}:
-            atv = known.get("average_transaction_value") or (450000 if clinic_type == "skin" else 300000)
-            est = max(int(round(revenue / max(atv, 1))), 1)
-            return est, 0.52, "revenue ÷ estimated average transaction value"
-        return 5000, 0.35, "generic annual patient volume baseline"
+        if revenue:
+            # atv is almost always predicted → penalise.
+            used_atv = atv or (450_000 if clinic_type == "skin" else 300_000)
+            est = max(int(round(revenue / max(used_atv, 1))), 1)
+            conf = 0.52 - _hop_penalty("revenue", "average_transaction_value") + _sr_bonus
+            return est, max(conf, 0.25), "revenue ÷ estimated average transaction value"
+        return 5_000, 0.35 + _sr_bonus, "generic annual patient volume baseline"
 
-    # Count fields
+    # ── Count fields (site-size guesses) ─────────────────────────────────────
     if field == "number_of_outlets":
-        return 1, 0.55, "single-site default"
+        return 1, 0.55 + _sr_bonus, "single-site default"
     if field == "number_of_doctors":
-        return 3, 0.42, "small clinic doctor baseline"
+        return 3, 0.42 + _sr_bonus, "small clinic doctor baseline"
     if field == "number_of_dentists":
-        return 3, 0.42, "small dental baseline"
+        return 3, 0.42 + _sr_bonus, "small dental baseline"
     if field == "number_of_therapists":
-        return 4, 0.42, "small clinic therapist baseline"
+        return 4, 0.42 + _sr_bonus, "small clinic therapist baseline"
     if field == "number_of_treatment_rooms":
-        return 4, 0.50, "small clinic room baseline"
+        return 4, 0.50 + _sr_bonus, "small clinic room baseline"
     if field == "number_of_dental_chairs":
-        return 3, 0.48, "small dental chair baseline"
+        return 3, 0.48 + _sr_bonus, "small dental chair baseline"
 
-    # Service mix predictions are handled separately.
+    # Service mix predictions are handled separately in scraper.py.
     return 0, 0.0, "unhandled"
 
 
+# ── Service mix ───────────────────────────────────────────────────────────────
+
 def service_mix_prediction(clinic_type: str) -> Dict[str, float]:
     if clinic_type == "skin":
-        return scale_mix(SKIN_SERVICE_MIX)
+        return _scale_mix(SKIN_SERVICE_MIX)
     if clinic_type == "dental":
-        return scale_mix(DENTAL_SERVICE_MIX)
+        return _scale_mix(DENTAL_SERVICE_MIX)
     if clinic_type == "both":
-        # Blend, then normalize.
         mix: Dict[str, float] = {}
         for k, v in SKIN_SERVICE_MIX.items():
             mix[k] = mix.get(k, 0.0) + v * 0.5
         for k, v in DENTAL_SERVICE_MIX.items():
             mix[k] = mix.get(k, 0.0) + v * 0.5
-        return scale_mix(mix)
-    return scale_mix({**SKIN_SERVICE_MIX, **DENTAL_SERVICE_MIX})
+        return _scale_mix(mix)
+    # unknown: return combined un-blended mix
+    return _scale_mix({**SKIN_SERVICE_MIX, **DENTAL_SERVICE_MIX})
